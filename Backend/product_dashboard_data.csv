@@ -1,0 +1,48 @@
+Country,Brand,Product Name,Product Group,Currency,Exchange Rate,Channel,Sales Value,Price Type,Start Date
+France,NUTRIPLUS A,NUTRIPLUS_VIAL_1500 ML_(4),Oncology,USD,Target FX Rate,Retail,186.48,EXF,30-05-2025
+France,NUTRIPLUS A,NUTRIPLUS_VIAL_1500 ML_(4),Neurology & Immunology,EUR,Target FX Rate,Other,312.21,EXF,26-04-2025
+India,NUTRIPLUS A,NUTRIPLUS_VIAL_1500 ML_(4),Neurology & Immunology,INR,Target FX Rate,Other,342.79,EXF,30-04-2025
+Germany,NUTRIPLUS B,NUTRIPLUS_VIAL_1500 ML_(4),Neurology & Immunology,USD,Target FX Rate,Other,261.56,EXF,30-04-2025
+Brazil,NUTRIPLUS B,NUTRIPLUS_VIAL_1500 ML_(4),Neurology & Immunology,USD,Target FX Rate,Distributor,229.18,EXF,31-01-2025
+India,NUTRIPLUS C,NUTRIPLUS_VIAL_1500 ML_(4),Neurology & Immunology,INR,Target FX Rate,Other,834.41,EXF,30-05-2025
+France,NUTRIPLUS C,NUTRIPLUS_VIAL_1500 ML_(4),Neurology & Immunology,EUR,Target FX Rate,Distributor,265.29,EXF,26-04-2025
+India,NUTRIPLUS B,NUTRIPLUS_VIAL_1500 ML_(4),Oncology,INR,Target FX Rate,Hospital,552.45,EXF,30-04-2025
+India,NUTRIPLUS B,NUTRIPLUS_VIAL_1500 ML_(4),Neurology & Immunology,INR,Target FX Rate,Hospital,186.48,EXF,30-04-2025
+Brazil,NUTRIPLUS A,NUTRIPLUS_VIAL_1500 ML_(4),Oncology,USD,Target FX Rate,Hospital,312.21,EXF,31-01-2025
+France,NUTRIPLUS B,NUTRIPLUS_VIAL_1500 ML_(4),Neurology & Immunology,EUR,Monthly FX Rate,Retail,342.79,EXF,30-05-2025
+France,NUTRIPLUS C,NUTRIPLUS_VIAL_1500 ML_(4),Neurology & Immunology,USD,Monthly FX Rate,Distributor,261.56,EXF,26-04-2025
+India,NUTRIPLUS A,NUTRIPLUS_VIAL_1500 ML_(4),Neurology & Immunology,INR,Monthly FX Rate,Other,229.18,EXF,30-04-2025
+India,NUTRIPLUS C,NUTRIPLUS_VIAL_1500 ML_(4),"Cardio, Metabolism & Endocrinology",INR,Monthly FX Rate,Distributor,834.41,EXF,30-04-2025
+France,NUTRIPLUS A,NUTRIPLUS_VIAL_250 ML_(10),"Cardio, Metabolism & Endocrinology",USD,Monthly FX Rate,Other,265.29,EXF,31-01-2025
+France,NUTRIPLUS B,NUTRIPLUS_VIAL_1500 ML_(4),"Cardio, Metabolism & Endocrinology",EUR,Monthly FX Rate,Hospital,552.45,EXF,30-05-2025
+Germany,NUTRIPLUS B,NUTRIPLUS_VIAL_250 ML_(10),"Cardio, Metabolism & Endocrinology",USD,Monthly FX Rate,Retail,186.48,EXF,26-04-2025
+Germany,NUTRIPLUS B,NUTRIPLUS_VIAL_250 ML_(10),"Cardio, Metabolism & Endocrinology",USD,Monthly FX Rate,Retail,312.21,EXF,30-04-2025
+Brazil,NUTRIPLUS C,NUTRIPLUS_VIAL_1500 ML_(4),Oncology,USD,Monthly FX Rate,Other,342.79,EXF,30-04-2025
+Brazil,NUTRIPLUS B,NUTRIPLUS_VIAL_250 ML_(10),Oncology,USD,Monthly FX Rate,Distributor,261.56,EXF,31-01-2025
+USA,NUTRIPLUS C,NUTRIPLUS_VIAL_1500 ML_(4),Oncology,USD,Monthly FX Rate,Hospital,229.18,EXF,30-05-2025
+France,NUTRIPLUS B,NUTRIPLUS_VIAL_250 ML_(10),"Cardio, Metabolism & Endocrinology",EUR,Target FX Rate,Hospital,834.41,EXF,26-04-2025
+India,NUTRIPLUS A,NUTRIPLUS_VIAL_250 ML_(10),"Cardio, Metabolism & Endocrinology",INR,Target FX Rate,Hospital,265.29,EXF,30-04-2025
+France,NUTRIPLUS A,NUTRIPLUS_VIAL_250 ML_(10),"Cardio, Metabolism & Endocrinology",USD,Monthly FX Rate,Retail,834.41,EXF,26-04-2025
+India,NUTRIPLUS A,NUTRIPLUS_VIAL_250 ML_(10),Oncology,INR,Monthly FX Rate,Distributor,265.29,EXF,30-04-2025
+India,NUTRIPLUS C,NUTRIPLUS_VIAL_250 ML_(10),Oncology,INR,Monthly FX Rate,Retail,552.45,EXF,30-04-2025
+India,NUTRIPLUS B,NUTRIPLUS_VIAL_250 ML_(10),"Cardio, Metabolism & Endocrinology",INR,Monthly FX Rate,Hospital,186.48,EXF,31-01-2025
+India,NUTRIPLUS C,NUTRIPLUS_VIAL_250 ML_(10),Oncology,INR,Monthly FX Rate,Retail,312.21,EXF,30-05-2025
+Germany,NUTRIPLUS C,NUTRIPLUS_VIAL_250 ML_(10),Oncology,USD,Monthly FX Rate,Other,342.79,EXF,26-04-2025
+Brazil,NUTRIPLUS B,NUTRIPLUS_VIAL_1000 ML_(6),Oncology,USD,Monthly FX Rate,Retail,261.56,EXF,30-04-2025
+France,NUTRIPLUS A,NUTRIPLUS_VIAL_1000 ML_(6),Fertility,EUR,Monthly FX Rate,Retail,229.18,EXF,30-04-2025
+France,NUTRIPLUS C,NUTRIPLUS_VIAL_250 ML_(10),"Cardio, Metabolism & Endocrinology",EUR,Monthly FX Rate,Hospital,834.41,EXF,31-01-2025
+France,NUTRIPLUS B,NUTRIPLUS_VIAL_1000 ML_(6),Fertility,EUR,Monthly FX Rate,Retail,265.29,EXF,30-05-2025
+France,NUTRIPLUS B,NUTRIPLUS_VIAL_1000 ML_(6),"Cardio, Metabolism & Endocrinology",EUR,Monthly FX Rate,Retail,552.45,EXF,26-04-2025
+India,NUTRIPLUS B,NUTRIPLUS_VIAL_1000 ML_(6),"Cardio, Metabolism & Endocrinology",INR,Monthly FX Rate,Distributor,186.48,EXF,30-04-2025
+France,NUTRIPLUS A,NUTRIPLUS_VIAL_1000 ML_(6),"Cardio, Metabolism & Endocrinology",EUR,Target FX Rate,Hospital,312.21,EXF,30-04-2025
+France,NUTRIPLUS A,NUTRIPLUS_VIAL_1000 ML_(6),Fertility,EUR,Target FX Rate,Distributor,342.79,EXF,30-05-2025
+India,NUTRIPLUS A,NUTRIPLUS_VIAL_1000 ML_(6),"Cardio, Metabolism & Endocrinology",USD,Target FX Rate,Retail,261.56,EXF,26-04-2025
+Germany,NUTRIPLUS C,NUTRIPLUS_VIAL_1000 ML_(6),Fertility,USD,Target FX Rate,Hospital,229.18,EXF,30-04-2025
+India,NUTRIPLUS C,NUTRIPLUS_VIAL_1000 ML_(6),Fertility,INR,Target FX Rate,Hospital,261.56,EXF,30-04-2025
+USA,NUTRIPLUS C,NUTRIPLUS_VIAL_1000 ML_(6),Fertility,USD,Target FX Rate,Hospital,229.18,EXF,31-01-2025
+France,NUTRIPLUS B,NUTRIPLUS_VIAL_250 ML_(10),Fertility,EUR,Target FX Rate,Hospital,834.41,EXF,30-05-2025
+USA,NUTRIPLUS C,NUTRIPLUS_VIAL_250 ML_(10),Fertility,USD,Target FX Rate,Retail,265.29,EXF,26-04-2025
+France,NUTRIPLUS A,NUTRIPLUS_VIAL_1000 ML_(6),Fertility,EUR,Target FX Rate,Distributor,552.45,EXF,30-04-2025
+India,NUTRIPLUS B,NUTRIPLUS_VIAL_250 ML_(10),Fertility,INR,Target FX Rate,Hospital,186.48,EXF,30-04-2025
+Germany,NUTRIPLUS C,NUTRIPLUS_VIAL_250 ML_(10),"Cardio, Metabolism & Endocrinology",USD,Target FX Rate,Distributor,312.21,EXF,31-01-2025
+France,NUTRIPLUS B,NUTRIPLUS_VIAL_250 ML_(10),"Cardio, Metabolism & Endocrinology",EUR,Target FX Rate,Hospital,342.79,EXF,30-05-2025

@@ -1,0 +1,38 @@
+[
+  {
+    "id": "pcr-1763365682796-1",
+    "number": "PCR-019688",
+    "country": "France",
+    "productFamily": "Product 1",
+    "changeReason": "Competitive Adjustment",
+    "approvalStatus": "Pending",
+    "autoApproved": false,
+    "currentPrice": 100.0,
+    "proposedPrice": 90.0,
+    "submittedDate": "2025-11-17T13:18:02.796951"
+  },
+  {
+    "id": "pcr-1763365682796-2",
+    "number": "PCR-019687",
+    "country": "Germany",
+    "productFamily": "Product 2",
+    "changeReason": "Regulatory Requirement",
+    "approvalStatus": "Approved",
+    "autoApproved": true,
+    "currentPrice": 120.0,
+    "proposedPrice": 130.0,
+    "submittedDate": "2025-11-17T13:18:02.796951"
+  },
+  {
+    "id": "pcr-1763365682796-3",
+    "number": "PCR-019686",
+    "country": "Brazil",
+    "productFamily": "Product 3",
+    "changeReason": "Price Change",
+    "approvalStatus": "Draft",
+    "autoApproved": false,
+    "currentPrice": 80.0,
+    "proposedPrice": 80.0,
+    "submittedDate": "2025-11-17T13:18:02.796951"
+  }
+]

@@ -1,0 +1,9 @@
+{
+  "name": "price-tool-frontend",
+  "private": true,
+  "scripts": {
+    "dev": "npm run dev --prefix price-tool-v2",
+    "build": "npm run build --prefix price-tool-v2",
+    "preview": "npm run preview --prefix price-tool-v2"
+  }
+}

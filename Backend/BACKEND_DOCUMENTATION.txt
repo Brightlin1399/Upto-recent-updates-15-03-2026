@@ -1,0 +1,501 @@
+================================================================================
+  PRICE TOOL - BACKEND DOCUMENTATION (SINGLE REFERENCE)
+================================================================================
+
+Plain text. Copy-paste friendly. No special characters.
+
+  Base URL:   http://127.0.0.1:8000  (or 5000 if you run uvicorn with --port 5000)
+  Postman:    See POSTMAN_API_LIST.md for every endpoint with method, URL, headers, and body examples to test one by one.
+  PCR list/get:  Header  X-User-Id: <integer>  required (so backend knows who is "logged in")
+  Chat APIs:  Header  X-User-Id: <integer>  required
+
+
+--------------------------------------------------------------------------------
+1. OVERVIEW
+--------------------------------------------------------------------------------
+
+  - Stack: FastAPI (app.py), SQLite via aiosqlite (database.py), notification_rules.py, models.py.
+  - All DB access and route handlers are async (async def / await).
+  - Roles: Local, Regional, Global, Admin. Local sees only their country's PCRs; Regional their region's; Global only escalated PCRs.
+  - Current price: from sku_price_history (latest effective_from <= date). Floor: from sku_mdgm_master. On finalise (Local only) we INSERT into sku_price_history only; no sku_channel_prices write.
+
+
+--------------------------------------------------------------------------------
+2. HOW TO RUN
+--------------------------------------------------------------------------------
+
+  From Backend folder:
+    python app.py
+    or
+    uvicorn app:app --host 0.0.0.0 --port 5000
+
+  DB file: price_tool.db (created on first run via lifespan).
+  Dependencies: aiosqlite, fastapi, uvicorn (see requirements.txt).
+
+
+--------------------------------------------------------------------------------
+3. PROJECT STRUCTURE
+--------------------------------------------------------------------------------
+
+  app.py
+    Creates the FastAPI app, registers lifespan (calls init_db on startup), adds CORS, and mounts all routers under prefix /api; no route definitions here.
+
+  routers/
+    health.py         Exposes GET /api/health to check that the backend is up.
+    users.py         GET /api/users (all users); Admin-only POST/PUT/DELETE /api/users for user management (X-User-Id, Admin role).
+    admin.py         Admin-only master data: SKUs, channels, brand-therapeutic_area, floor prices. All require X-User-Id header, Admin role.
+    chats.py         Exposes chat endpoints: create/get direct chat, list user's chats, get messages, send message; uses chat_helpers and requires X-User-Id.
+    pcrs.py          Exposes all PCR endpoints (submit, approve/reject, get, update, regional-edit, finalise, resubmit) plus product-by-name history, SKU history, and current price; uses pcr_helpers and notification_rules.
+    product_360.py   Product 360: regions, countries, brands (by country), overview (marketed + PCR count), pricing (single query, no N+1); uses get_therapeutic_area_for_brand.
+    notifications.py Exposes GET user notifications, PUT mark one read, PUT mark all read for a user.
+
+  helpers/
+    pcr_helpers.py   Shared logic for PCR flow: brand therapeutic area lookup, user-can-approve check, and price parsing for auto-approve.
+    chat_helpers.py  Shared logic for chats: get-or-create direct chat and check if user is participant.
+
+  database.py
+    Provides async aiosqlite connection to price_tool.db, init_db (tables + seed), and ensure_system_groups (group chat "All").
+  notification_rules.py
+    Creates notifications and triggers notify_on_local_approve, notify_on_regional_approve_reject, notify_on_escalate_to_global, notify_on_global_approve_reject, and notify_on_finalise based on PCR events.
+  models.py
+    Pydantic models for request bodies (SubmitPCRRequest, ApproveRejectRequest, etc.) and response shapes.
+
+
+--------------------------------------------------------------------------------
+4. DATABASE (database.py)
+--------------------------------------------------------------------------------
+
+  File: price_tool.db (SQLite)
+
+  users          id, name, email (UNIQUE), role (Local|Regional|Global|Admin), country, therapeutic_area, region
+  pcrs           pcr_id_display (PK), product_id, product_name, submitted_by, status, local_approved_by,
+                 regional_approved_by, current_price, proposed_price, country, therapeutic_area,
+                 product_skus (comma-separated), channel, price_type, price_change_*, submission_context,
+                 proposed_percent, effective_date, finalized_at, is_discontinue_price, created_at, updated_at
+  notifications  id, user_id, pcr_id, type, title, message, is_read, created_at
+  sku_mdgm_master  (sku_id, country, therapeutic_area, channel, price_type) per row; currency and other master attributes. Current price is stored in current_price_eur; history is in sku_price_history. Brands, SKUs, and channels are derived from MDGM (no separate brand_therapeutic_area, skus, or channels tables).
+  sku_price_history  Append-only. sku_id, country, therapeutic_area, channel, price_type, price_eur, effective_from, pcr_id. Finalise INSERTs here; get_current_price_eur reads latest effective_from <= date from here.
+  sku_channel_prices  Legacy table; not used for live reads. Floor and current are from sku_mdgm_master and sku_price_history.
+  chats          id, type (direct|group), name, created_at
+  chat_participants   chat_id, user_id, joined_at  (PK: chat_id, user_id)
+  messages       id, chat_id, sender_id, body, created_at
+
+  --- database.py functions (all async) ---
+  get_connection()
+    Returns an aiosqlite connection to price_tool.db; caller must await conn.close() when done.
+  ensure_system_groups()
+    Creates or refreshes the group chat named "All" and adds all users as participants.
+  init_db()
+    Creates all tables if missing, seeds users when empty, then calls ensure_system_groups; run at app startup via lifespan. Master data (brands, SKUs, channels) comes from sku_mdgm_master.
+
+
+--------------------------------------------------------------------------------
+4b. PRICE FLOW (single source of truth)
+--------------------------------------------------------------------------------
+
+  Where to read/write "price":
+    - Current approved price   -> sku_price_history (get_current_price_eur: latest row with effective_from <= date).
+    - Request (proposed)       -> pcrs.proposed_price.
+    - Official/reference       -> sku_mdgm_master (official_*, etc.).
+
+  At submit:
+    1. Require current = get_current_price_eur(sku, country, TA, channel, price_type) from history or MDGM for every SKU.
+    2. Status always set to local_approved (Regional path). No auto-approval, no floor checks.
+
+  At finalise (Local only):
+    For each SKU: INSERT one row into sku_price_history (price_eur, effective_from, pcr_id). No write to sku_channel_prices.
+
+  What each "price" means (do not mix):
+    pcrs.proposed_price        = price being requested in this PCR.
+    sku_price_history.price_eur = approved price (live current = latest effective_from <= today).
+    sku_mdgm_master.official_*_eur  = reference from master data (not PCR-driven).
+
+
+--------------------------------------------------------------------------------
+5. PCR LIFECYCLE (BUSINESS RULES)
+--------------------------------------------------------------------------------
+
+  Submit          Only Local (own country+TA). All PCRs -> local_approved (Regional path). Notifications to submitter and Regional (same region). No auto-approval, no floor.
+  Regional approve  Status = local_approved -> regional_approved, store regional_approved_price_eur. Regional reject -> status = draft, back to Local. No floor-based escalation.
+  Global approve/reject  Only when status = escalated_to_global. Approve -> global_approved; Reject -> status = draft.
+  Save as draft   Only Local. POST /pcrs with save_as_draft: true creates status = draft.
+  Update PCR      Only Local (own country+TA). Status = draft, rejected, local_approved, or regional_approved. Regional cannot full update or resubmit.
+  Regional edit   Only Regional (same region as PCR). Status = regional_approved. Metadata only (no proposed_price).
+  Finalise        Only Local (own country+TA). Status = regional_approved or global_approved. Re-checks vs approved price; INSERT sku_price_history only.
+  Resubmit        Only Local (own country+TA). Status = draft or rejected. -> submitted, approvers cleared; runs submit flow again.
+
+
+--------------------------------------------------------------------------------
+6. HELPER FUNCTIONS (helpers/)
+--------------------------------------------------------------------------------
+
+  --- pcr_helpers.py ---
+  get_therapeutic_area_for_brand(brand) / _therapeutic_area_for_brand(brand)
+    Returns the therapeutic_area for the given brand from sku_mdgm_master (first row for that brand), or None if not found. Used in Product 360 and PCR flow.
+  _user_can_approve_for_pcr(user_id, pcr_id)
+    Used for Regional/Global only. Regional: True if user.region = PCR's country.region. Global: True if status = escalated_to_global. Local uses country+TA in each endpoint (submit, update, resubmit, finalise).
+  _parse_price(s)
+    Strips currency prefix (EUR, USD, etc.), converts comma to dot, and parses to float; used for price comparisons.
+
+  --- chat_helpers.py ---
+  _get_or_create_direct_chat(user_id_1, user_id_2)
+    Finds an existing direct chat between the two users or creates a new one; returns chat_id, or None if same user.
+  _chat_is_participant(chat_id, user_id)
+    Returns True if the user is in chat_participants for that chat; used before listing or sending messages.
+
+
+--------------------------------------------------------------------------------
+7. NOTIFICATION RULES (notification_rules.py)
+--------------------------------------------------------------------------------
+
+  All functions are async. Notifications: Local approve notifies Regional in same region; Regional/Global approve/reject notify submitter and approvers; finalise notifies submitter and all who approved.
+
+  create_notification(user_id, pcr_id, notification_type, title, message)
+    Inserts one row into the notifications table for the given user and PCR.
+
+  get_pcr_with_users(pcr_id_display)
+    Returns one PCR row with country, therapeutic_area, and submitter/approver names and emails; uses LEFT JOIN so PCR is returned even if submitter user is missing.
+
+  _pcr_label(pcr)
+    Returns pcr_id_display for use in notification titles, or a fallback like "PCR-#<id>" if missing.
+
+  notify_on_local_approve(pcr_id)
+    When a PCR receives Local approval (on submit), notifies submitter, Regional users in the same region (and TA), and the local approver.
+
+  notify_on_regional_approve_reject(pcr_id, action)
+    When Regional approves or rejects, notifies submitter, local approver (if different), and regional approver with a "You approved/rejected at Regional" message.
+
+
+--------------------------------------------------------------------------------
+8. REQUEST MODELS (models.py)
+--------------------------------------------------------------------------------
+
+  SubmitPCRRequest
+    Body for creating a PCR: submitted_by, pcr_id, country, brand, product_skus required; rest optional (product_name, prices, dates, etc.).
+  ApproveRejectRequest
+    Body for approve/reject endpoints: approved_by (int) for approve, rejected_by (int) for reject.
+  UpdatePCRRequest
+    Body for updating a rejected PCR: edited_by required; optional fields for product and price metadata.
+  RegionalEditPCRRequest
+    Body for Regional edit after approval: edited_by required; optional metadata only (no proposed_price or current_price).
+  FinalisePCRRequest
+    Body for finalise: finalised_by (user id of Local user; only Local can finalise).
+  ResubmitPCRRequest
+    Body for resubmit: re_submitted_by (user id of Local user).
+  DirectChatCreate
+    Body for creating a direct chat: user_id of the other user.
+  SendMessageRequest
+    Body for sending a chat message: body (text).
+  GroupChatCreate
+    Body for group chat (name, member_ids); no POST route implemented yet.
+
+
+--------------------------------------------------------------------------------
+9. API REFERENCE — ALL ENDPOINTS (with one-line description)
+--------------------------------------------------------------------------------
+
+  --- Health ---
+  GET   /api/health
+        Check that the backend is running; returns status and message.
+        Response: {"status": "ok", "message": "Backend is running"}
+
+  --- Users ---
+  GET   /api/users
+        Returns all users with id, name, email, role, country, therapeutic_area (e.g. for dropdowns and assignment).
+        Response: {"users": [{"id", "name", "email", "role", "country", "therapeutic_area"}, ...]}
+
+  --- Admin user management (header X-User-Id required; caller must be Admin) ---
+  POST  /api/users
+        Create a new user. Admin only. Header: X-User-Id (Admin user id). Body: name, email, role (Local|Regional|Global|Admin), optional country, therapeutic_area. Response 201: created user object.
+  PUT   /api/users/{user_id}
+        Update a user. Admin only. Header: X-User-Id. Body: optional name, email, role, country, therapeutic_area (at least one required). Response: updated user object.
+  DELETE /api/users/{user_id}
+        Delete a user. Admin only. Header: X-User-Id. Fails with 400 if user is referenced in pcrs, notifications, chat_participants, or messages. Response: {"message": "User deleted", "user_id": ...}
+
+  --- Admin: master data (SKUs, channels, brands) is derived from MDGM; no separate admin CRUD endpoints for those. ---
+  --- PCRs: create and read ---
+  POST  /api/pcrs
+        Creates a new PCR; only Local users can submit, and only for their own country and therapeutic area; triggers notifications to Local (same country+TA).
+        Body: submitted_by (int), pcr_id (str), country (str), brand (str), product_skus (list). Optional: product_name, product_id, current_price, proposed_price, price_change_type, expected_response_date, price_change_reason, price_change_reason_comments, submission_context, proposed_percent, is_discontinue_price, effective_date.
+        Response 201: {"message": "PCR submitted successfully", "pcr_id": "..."}
+
+  GET   /api/pcrs
+        Returns PCRs filtered by role: Local = own country; Regional = own region; Global = only escalated_to_global; Admin = all. Submitter and approver names joined.
+        Response: {"pcrs": [{...}, ...]}
+
+  GET   /api/pcrs/{pcr_id}
+        Returns a single PCR by its display id (e.g. PCR-001) with submitter and approver names; 404 if not found.
+        Response: {...} or 404
+
+  --- PCRs: approval ---
+  PUT   /api/pcrs/{pcr_id}/regional-approve
+        Regional user approves the PCR; status must be local_approved. Status -> regional_approved. Body: {"approved_by": <user_id>}
+  PUT   /api/pcrs/{pcr_id}/regional-reject
+        Regional user rejects the PCR; status becomes draft, back to Local. Body: {"rejected_by": <user_id>}
+
+  --- PCRs: edit, finalise, resubmit ---
+  PUT   /api/pcrs/{pcr_id}
+        Updates a draft or rejected PCR (Local only, own country+TA); status must be draft or rejected; at least one optional field required.
+        Body: edited_by (required). Optional: pcr_id_display, product_id, product_name, current_price, proposed_price, product_skus, price_change_type, expected_response_date, price_change_reason, price_change_reason_comments, submission_context, proposed_percent, is_discontinue_price, effective_date.
+
+  PUT   /api/pcrs/{pcr_id}/regional-edit
+        Regional user edits an approved PCR (status regional_approved); cannot change proposed_price or current_price; only metadata fields.
+        Body: edited_by (required). Optional: price_change_type, expected_response_date, price_change_reason, price_change_reason_comments, submission_context, product_skus, proposed_percent, is_discontinue_price, effective_date.
+
+  PUT   /api/pcrs/{pcr_id}/finalise
+        Local finalises the PCR (own country+TA); status must be regional_approved or global_approved. Inserts into sku_price_history per SKU only. Body: {"finalised_by": <user_id>}
+
+  PUT   /api/pcrs/{pcr_id}/resubmit
+        Local user resubmits a rejected PCR; status becomes submitted and approvers are cleared so the flow can start again. Body: {"re_submitted_by": <user_id>}
+
+  --- Product / SKU history and current price ---
+  GET   /api/products/by-name/{product_name}/pcrs
+        Returns all PCRs where product_name matches; used for product-level history. 404 if none.
+        Response: {"product_name": "...", "pcrs": [{...}, ...]} or 404
+
+  GET   /api/skus/{sku_id}/pcrs
+        Returns all PCRs that contain this SKU in product_skus (whole-token match); response forces sku_id/product_skus to the requested SKU for display. 404 if none.
+        Response: {"sku_id": "...", "pcrs": [{...}, ...]} or 404
+
+  GET   /api/countries/{country}/skus/{sku_id}/current-price
+        Returns the current price for the given SKU/country/TA/channel/price_type from sku_price_history (latest effective_from <= today). Query params: therapeutic_area (required), channel (default Retail), price_type (required). 404 if not found.
+        Response: {sku_id, country, therapeutic_area, channel, price_type, current_price}
+
+  --- Product 360 ---
+  GET   /api/product-360/regions          List regions (filter dropdown).
+  GET   /api/product-360/countries        List countries (query: region optional).
+  GET   /api/product-360/brands           List brands for a country (query: country required).
+  GET   /api/product-360/overview        Overview tab: marketed countries, PCR count by country (query: brand; country/region optional).
+  GET   /api/product-360/pricing          Pricing tab: one row per (SKU, channel, price_type) for brand+country; current from sku_price_history (query: brand, country; optional currency, target_fx_date). Response: {brand, country, therapeutic_area, pricing: [{sku_id, channel, price_type, current_price_eur, currency}, ...]}.
+
+  --- Notifications ---
+  GET   /api/users/{user_id}/notifications
+        Returns the list of notifications for the user (e.g. for bell icon), joined with PCR info; limited to 50 most recent.
+        Response: {"notifications": [{...}, ...]}
+
+  PUT   /api/notifications/{notification_id}/read
+        Marks a single notification as read by id.
+        Response: {"message": "Notification marked as read"}
+
+  --- Admin: MDGM (sku_mdgm_master) - Admin only, X-User-Id required ---
+  GET   /api/admin/mdgm
+        List MDGM rows. Query: sku_id, country, brand, therapeutic_area (all optional), limit (optional, 1-500).
+        Response: {"rows": [{id, sku_id, country, ..., current_price_eur}, ...]}
+  POST  /api/admin/mdgm
+        Create one MDGM row. Body: sku_id, country, therapeutic_area, brand, channel (default Retail); optional: region, global_product_name, local_product_name, pu, measure, dimension, volume_of_container, container, strength, currency, erp_applicable, pack_size, reimbursement_*, marketed_status, price_type, current_price_eur. Unique key (sku_id, country, channel, price_type). 400 if duplicate.
+        Response 201: full created row (all columns).
+  PUT   /api/admin/mdgm/{row_id}
+        Update one MDGM row by id. Body: any subset of columns (all optional). Response: updated full row.
+  DELETE /api/admin/mdgm/{row_id}
+        Delete one MDGM row by id. Response: {"message": "MDGM row deleted", "id": ...}
+
+  --- Product 360 (optional X-User-Id for role-based filtering) ---
+  GET   /api/product-360/therapeutic-areas   Query: country (optional), region (optional).
+  GET   /api/product-360/mdgm-details       Query: brand, country; optional therapeutic_area. Returns all MDGM columns per row.
+  GET   /api/product-360/audit-trail        Admin only. Query: brand, country, sku_id (all optional), limit (optional). Response: {"audit_entries": [...]}
+
+  --- Chats (header X-User-Id required) ---
+  GET   /api/chats
+        Returns all chats the current user participates in (includes "All" group and direct chats), with participant_ids per chat.
+        Response: {"chats": [{"chat_id", "type", "name", "created_at", "participant_ids"}, ...]}
+
+  POST  /api/chats/direct
+        Creates a new direct chat with another user or returns the existing one; body is the other user's id.
+        Body: {"user_id": <other_user_id>}
+        Response 201: {"chat_id", "type": "direct", "participant_ids": [...]}
+
+  GET   /api/chats/{chat_id}/messages
+        Returns all messages in the chat in order; caller must be a participant (X-User-Id).
+        Response: {"messages": [{"id", "chat_id", "sender_id", "body", "created_at"}, ...]}
+
+  POST  /api/chats/{chat_id}/messages
+        Sends a new message in the chat; caller must be a participant (X-User-Id).
+        Body: {"body": "<text>"}
+        Response 201: {"id", "chat_id", "sender_id", "body"}
+
+
+--------------------------------------------------------------------------------
+9b. TESTING - ALL ENDPOINTS WITH EXAMPLES (copy-paste)
+--------------------------------------------------------------------------------
+  Base URL:  http://127.0.0.1:5000/api   (or 8000 if you use default uvicorn)
+  Where X-User-Id is required, use header:  X-User-Id: 1   (1 = Admin in seed; 2 = Local IN CMC, etc.)
+
+  --- Health ---
+  GET   http://127.0.0.1:5000/api/health
+
+  --- Users (no auth for GET) ---
+  GET   http://127.0.0.1:5000/api/users
+
+  --- Admin: Users (X-User-Id: Admin id, e.g. 5 or 1 if seed has Admin) ---
+  POST  http://127.0.0.1:5000/api/users
+        Headers: X-User-Id: 1   Content-Type: application/json
+        Body: {"name": "Test User", "email": "test@example.com", "role": "Local", "country": "IN", "therapeutic_area": "CMC"}
+
+  PUT   http://127.0.0.1:5000/api/users/2
+        Headers: X-User-Id: 1   Content-Type: application/json
+        Body: {"name": "Updated Name", "role": "Local"}
+
+  DELETE http://127.0.0.1:5000/api/users/2
+        Headers: X-User-Id: 1
+
+  --- Admin: MDGM ---
+  GET   http://127.0.0.1:5000/api/admin/mdgm
+        Headers: X-User-Id: 1
+  GET   http://127.0.0.1:5000/api/admin/mdgm?sku_id=SKU-001&country=IN&limit=10
+        Headers: X-User-Id: 1
+
+  POST  http://127.0.0.1:5000/api/admin/mdgm
+        Headers: X-User-Id: 1   Content-Type: application/json
+        Body (minimal): {"sku_id": "SKU-NEW", "country": "IN", "therapeutic_area": "CMC", "brand": "EUTHYROX", "channel": "Retail"}
+        Body (full example): {"sku_id": "SKU-NEW", "country": "IN", "therapeutic_area": "CMC", "brand": "EUTHYROX", "channel": "Retail", "price_type": "NSP Minimum", "region": "APAC", "current_price_eur": 99.5, "currency": "EUR", "marketed_status": "Marketed"}
+
+  PUT   http://127.0.0.1:5000/api/admin/mdgm/1
+        Headers: X-User-Id: 1   Content-Type: application/json
+        Body: {"current_price_eur": 105.0, "marketed_status": "Marketed"}
+
+  DELETE http://127.0.0.1:5000/api/admin/mdgm/1
+        Headers: X-User-Id: 1
+
+  --- PCRs (X-User-Id = current user) ---
+  POST  http://127.0.0.1:5000/api/pcrs
+        Headers: X-User-Id: 1   Content-Type: application/json
+        Body: {"submitted_by": 1, "pcr_id": "PCR-IN-2026-003", "country": "IN", "brand": "EUTHYROX", "product_skus": ["SKU-001"], "product_name": "EUTHYROX 100mcg", "proposed_price": "110", "channel": "Retail", "price_type": "NSP Minimum", "effective_date": "2026-04-01"}
+
+  GET   http://127.0.0.1:5000/api/pcrs
+        Headers: X-User-Id: 1
+
+  GET   http://127.0.0.1:5000/api/pcrs/PCR-IN-2026-002
+        Headers: X-User-Id: 1
+
+  PUT   http://127.0.0.1:5000/api/pcrs/PCR-IN-2026-002/regional-approve
+        Headers: Content-Type: application/json
+        Body: {"approved_by": 3}
+
+  PUT   http://127.0.0.1:5000/api/pcrs/PCR-IN-2026-002/regional-reject
+        Body: {"rejected_by": 3}
+
+  PUT   http://127.0.0.1:5000/api/pcrs/PCR-IN-2026-002/global-approve
+        Body: {"approved_by": 4}
+  PUT   http://127.0.0.1:5000/api/pcrs/PCR-IN-2026-002/global-reject
+        Body: {"rejected_by": 4}
+
+  PUT   http://127.0.0.1:5000/api/pcrs/PCR-IN-2026-002
+        Headers: X-User-Id: 1   Content-Type: application/json
+        Body: {"edited_by": 1, "proposed_price": "108", "effective_date": "2026-05-01"}
+
+  PUT   http://127.0.0.1:5000/api/pcrs/PCR-IN-2026-002/regional-edit
+        Body: {"edited_by": 3, "effective_date": "2026-06-01"}
+
+  PUT   http://127.0.0.1:5000/api/pcrs/PCR-IN-2026-002/finalise
+        Body: {"finalised_by": 1}
+
+  PUT   http://127.0.0.1:5000/api/pcrs/PCR-IN-2026-002/resubmit
+        Body: {"re_submitted_by": 1}
+
+  --- Product / SKU / Price ---
+  GET   http://127.0.0.1:5000/api/products/by-name/EUTHYROX%20100mcg/pcrs
+  GET   http://127.0.0.1:5000/api/skus/SKU-001/pcrs
+  GET   http://127.0.0.1:5000/api/countries/IN/skus/SKU-001/current-price?therapeutic_area=CMC&channel=Retail&price_type=NSP%20Minimum
+  GET   http://127.0.0.1:5000/api/countries/IN/skus/SKU-001/price-history?therapeutic_area=CMC&channel=Retail&price_type=NSP%20Minimum
+  GET   http://127.0.0.1:5000/api/countries/IN/skus/SKU-001/prices
+
+  --- Product 360 ---
+  GET   http://127.0.0.1:5000/api/product-360/regions
+        Optional: Headers: X-User-Id: 1
+
+  GET   http://127.0.0.1:5000/api/product-360/countries
+  GET   http://127.0.0.1:5000/api/product-360/countries?region=APAC
+
+  GET   http://127.0.0.1:5000/api/product-360/therapeutic-areas
+  GET   http://127.0.0.1:5000/api/product-360/therapeutic-areas?country=IN
+
+  GET   http://127.0.0.1:5000/api/product-360/brands?country=IN
+  GET   http://127.0.0.1:5000/api/product-360/brands?country=IN&therapeutic_area=CMC
+
+  GET   http://127.0.0.1:5000/api/product-360/skus?brand=EUTHYROX&country=IN
+  GET   http://127.0.0.1:5000/api/product-360/skus?brand=EUTHYROX&country=IN&therapeutic_area=CMC
+
+  GET   http://127.0.0.1:5000/api/product-360/overview?brand=EUTHYROX
+  GET   http://127.0.0.1:5000/api/product-360/overview?brand=EUTHYROX&country=IN
+
+  GET   http://127.0.0.1:5000/api/product-360/pricing?brand=EUTHYROX&country=IN
+  GET   http://127.0.0.1:5000/api/product-360/pricing?brand=EUTHYROX&country=IN&therapeutic_area=CMC
+
+  GET   http://127.0.0.1:5000/api/product-360/mdgm-details?brand=EUTHYROX&country=IN
+  GET   http://127.0.0.1:5000/api/product-360/mdgm-details?brand=EUTHYROX&country=IN&therapeutic_area=CMC
+
+  GET   http://127.0.0.1:5000/api/product-360/audit-trail
+        Headers: X-User-Id: 1   (Admin only)
+  GET   http://127.0.0.1:5000/api/product-360/audit-trail?brand=EUTHYROX&country=IN&sku_id=SKU-001
+        Headers: X-User-Id: 1
+
+  --- Notifications ---
+  GET   http://127.0.0.1:5000/api/users/1/notifications
+  PUT   http://127.0.0.1:5000/api/notifications/1/read
+  PUT   http://127.0.0.1:5000/api/users/1/notifications/read-all
+
+  --- Chats ---
+  POST  http://127.0.0.1:5000/api/chats/direct
+        Headers: X-User-Id: 1   Content-Type: application/json
+        Body: {"user_id": 2}
+
+  GET   http://127.0.0.1:5000/api/chats
+        Headers: X-User-Id: 1
+
+  GET   http://127.0.0.1:5000/api/chats/1/messages
+        Headers: X-User-Id: 1
+
+  POST  http://127.0.0.1:5000/api/chats/1/messages
+        Headers: X-User-Id: 1   Content-Type: application/json
+        Body: {"body": "Hello"}
+
+  --- Debug ---
+  GET   http://127.0.0.1:5000/api/debug/sku-no-history
+
+
+--------------------------------------------------------------------------------
+10. REQUEST BODY EXAMPLES (JSON)
+--------------------------------------------------------------------------------
+
+  Submit PCR:
+    {"submitted_by": 1, "pcr_id": "PCR-001", "country": "IN", "brand": "EUTHYROX", "product_skus": ["SKU-1"], "product_name": "Product A", "current_price": "100", "proposed_price": "120"}
+
+  Approve / Reject:
+    {"approved_by": 2}   or   {"rejected_by": 2}
+
+  Update PCR (rejected):
+    {"edited_by": 1, "product_name": "Updated name", "proposed_price": "105"}
+
+  Regional edit:
+    {"edited_by": 3, "price_change_reason": "Market update", "effective_date": "2025-03-01"}
+
+  Finalise:   {"finalised_by": 1}
+  (Example: 1 = Local user; only Local can finalise.)
+  Resubmit:   {"re_submitted_by": 1}
+  Direct chat:   {"user_id": 2}
+  Send message:   {"body": "Hello"}
+
+
+--------------------------------------------------------------------------------
+11. SEED DATA (when DB empty)
+--------------------------------------------------------------------------------
+
+  Users:  1 Vishal  Local IN CMC | 2 Rajesh Local IN CMC | 3 Rati Regional IN CMC | 4 Ramya Regional JP CMC
+  Brands: EUTHYROX -> CMC, BAVENCIO -> Fertility & NDD, Crocin -> OTC, Dart -> Cardiology
+  Group chat "All" is created/updated with all users (ensure_system_groups).
+
+
+--------------------------------------------------------------------------------
+12. LIFESPAN
+--------------------------------------------------------------------------------
+
+  At server startup: await database.init_db(). Tables and seed data created before any request. Optional shutdown code can be added after the yield.
+
+
+--------------------------------------------------------------------------------
+13. NOT IMPLEMENTED
+--------------------------------------------------------------------------------
+
+  Escalation criteria (table exists; no API or rules). Audit log. Group chat create API (model exists; no POST route).
+
+================================================================================
