@@ -8,7 +8,6 @@ import { ProfilePage } from "./ProfilePage";
 import SummaryPage from "./SummaryPage";
 import PriceProposalPage from "./PriceProposalPage";
 import FinancialsPage from "./FinancialsPage";
-import EscalationPage from "./EscalationPage";
 import RecommendationPage from "./RecommendationPage";
 import AdminPage from "./AdminPage";
 
@@ -49,7 +48,6 @@ function App() {
         <Route index element={<SummaryPage />} />
         <Route path="PriceProposalPage" element={<PriceProposalPage />} />
         <Route path="FinancialsPage" element={<FinancialsPage />} />
-        <Route path="EscalationPage" element={<EscalationPage />} />
         <Route path="RecommendationPage" element={<RecommendationPage />} />
         <Route path="AdminPage" element={<AdminPage loggedInUser={loggedInUser} />} />
         </Route>
