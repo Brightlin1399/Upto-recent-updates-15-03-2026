@@ -105,7 +105,6 @@ async def init_db():
         name TEXT NOT NULL,
         email TEXT UNIQUE NOT NULL,
         role TEXT NOT NULL CHECK(role IN('Local', 'Regional', 'Global', 'Admin')),
-        country TEXT,
         therapeutic_area TEXT,
         region TEXT
         );
@@ -130,6 +129,7 @@ async def init_db():
                 country TEXT,
                 therapeutic_area TEXT,
                 product_skus TEXT,
+                submission_attachments TEXT,
                 price_change_type TEXT,
                 expected_response_date TEXT,
                 price_change_reason TEXT,
@@ -155,13 +155,21 @@ async def init_db():
                 FOREIGN KEY (global_approved_by) REFERENCES users(id)
             );
         """)
-        # Ensure new approval reference price columns exist on existing databases
+        # Ensure new approval reference price and attachment columns exist on existing databases
         async with conn.execute("PRAGMA table_info(pcrs)") as cur:
             pcr_cols = [row[1] for row in await cur.fetchall()]
         if "regional_approved_price_eur" not in pcr_cols:
             await conn.execute("ALTER TABLE pcrs ADD COLUMN regional_approved_price_eur REAL")
         if "global_approved_price_eur" not in pcr_cols:
             await conn.execute("ALTER TABLE pcrs ADD COLUMN global_approved_price_eur REAL")
+        # Submission attachments (Local -> Regional): optional, stored as comma-separated presigned URLs.
+        if "submission_attachments" not in pcr_cols:
+            await conn.execute("ALTER TABLE pcrs ADD COLUMN submission_attachments TEXT")
+        # Escalation metadata (Regional -> Global). Stored as comma-separated attachment references and optional comments.
+        if "escalation_attachments" not in pcr_cols:
+            await conn.execute("ALTER TABLE pcrs ADD COLUMN escalation_attachments TEXT")
+        if "escalation_comments" not in pcr_cols:
+            await conn.execute("ALTER TABLE pcrs ADD COLUMN escalation_comments TEXT")
 
         await conn.execute("""
             CREATE TABLE IF NOT EXISTS sku_channel_prices (
@@ -211,14 +219,13 @@ async def init_db():
             CREATE TABLE IF NOT EXISTS notifications(
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 user_id INTEGER NOT NULL,
-                pcr_id TEXT NOT NULL,
+                pcr_id TEXT,
                 type TEXT NOT NULL,
                 title TEXT NOT NULL,
                 message TEXT,
                 is_read INTEGER DEFAULT 0,
                 created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
-                FOREIGN KEY (user_id) REFERENCES users(id),
-                FOREIGN KEY (pcr_id) REFERENCES pcrs(pcr_id_display)
+                FOREIGN KEY (user_id) REFERENCES users(id)
             );
         """)
         await conn.execute("""
@@ -333,19 +340,32 @@ async def init_db():
                     "INSERT INTO countries (code, name, region) VALUES (?, ?, ?), (?, ?, ?), (?, ?, ?), (?, ?, ?)",
                     ("IN", "India", "APAC", "JP", "Japan", "APAC", "AL", "Albania", "EMEA", "BA", "Bosnia and Herzegovina", "EMEA"),
                 )
+        await conn.execute("""
+            CREATE TABLE IF NOT EXISTS user_countries (
+                user_id INTEGER NOT NULL,
+                country TEXT NOT NULL,
+                PRIMARY KEY (user_id, country),
+                FOREIGN KEY (user_id) REFERENCES users(id),
+                FOREIGN KEY (country) REFERENCES countries(code)
+            );
+            """)
         async with conn.execute("SELECT COUNT(*) FROM users") as cur:
             count = (await cur.fetchone())[0]
         if count == 0:
             await conn.executescript("""
-                INSERT INTO users (name, email, role, country, therapeutic_area, region) VALUES
-                    ('Vishal', 'vishal@gmail.com', 'Local', 'IN', 'CMC', 'APAC'),
-                    ('Rajesh', 'rajesh@gmail.com', 'Local', 'IN', 'CMC', 'APAC'),
-                    ('Rati', 'rati@gmail.com', 'Regional', 'IN', 'CMC', 'APAC'),
-                    ('Ramya', 'ramya@gmail.com', 'Regional', 'JP', 'Oncology', 'APAC'),
-                    ('Michael', 'micheal@gmail.com', 'Global', NULL, NULL, NULL),
-                    ('Sarah', 'sarah@gmail.com', 'Admin', NULL, NULL, NULL);
+                INSERT INTO users (name, email, role, therapeutic_area, region) VALUES
+                    ('Vishal', 'vishal@gmail.com', 'Local', 'CMC', 'APAC'),
+                    ('Rajesh', 'rajesh@gmail.com', 'Local', 'CMC', 'APAC'),
+                    ('Rati', 'rati@gmail.com', 'Regional', 'CMC', 'APAC'),
+                    ('Ramya', 'ramya@gmail.com', 'Regional', 'Oncology', 'APAC'),
+                    ('Michael', 'micheal@gmail.com', 'Global', NULL, NULL),
+                    ('Sarah', 'sarah@gmail.com', 'Admin', NULL, NULL);
+                INSERT INTO user_countries (user_id, country)
+                SELECT id, 'IN' FROM users WHERE email IN ('vishal@gmail.com', 'rajesh@gmail.com');
+                INSERT INTO user_countries (user_id, country)
+                SELECT id, 'JP' FROM users WHERE email = 'vishal@gmail.com';
             """)
-            print("Added 6 users (Local, Regional, Global, Admin)")
+            print("Added 6 users (Local, Regional, Global, Admin) and user_countries for Local (Vishal: IN, JP; Rajesh: IN)")
         await conn.commit()
     finally:
         await conn.close()

@@ -6,7 +6,9 @@ from fastapi import APIRouter, Header, HTTPException, Query, Path, Body
 router = APIRouter()
 import database
 from database import MDGM_COLS
-from models import CreateMDGMRequest, UpdateMDGMRequest
+from models import CreateMDGMRequest, UpdateMDGMRequest, AdminPCRUpdateRequest
+from helpers.pcr_helpers import get_brand_from_mdgm
+from notification_rules import notify_admin_action
 
 
 async def _require_admin(x_user_id: int) -> None:
@@ -124,6 +126,16 @@ async def create_mdgm(
         if row:
             created = dict(row)
             try:
+                await notify_admin_action(
+                    created.get("country"),
+                    created.get("therapeutic_area"),
+                    "addition",
+                    f"SKU {created.get('sku_id', '')} added",
+                    pcr_id=None,
+                )
+            except Exception:
+                pass
+            try:
                 await database.log_audit(
                     user_id=x_user_id,
                     action="MDGM create",
@@ -141,6 +153,16 @@ async def create_mdgm(
             row = await cur.fetchone()
         fallback = dict(row) if row else {}
         if fallback:
+            try:
+                await notify_admin_action(
+                    fallback.get("country"),
+                    fallback.get("therapeutic_area"),
+                    "addition",
+                    f"SKU {fallback.get('sku_id', '')} added",
+                    pcr_id=None,
+                )
+            except Exception:
+                pass
             try:
                 await database.log_audit(
                     user_id=x_user_id,
@@ -268,6 +290,16 @@ async def update_mdgm(
         updated = dict(row) if row else {}
         if updated:
             try:
+                await notify_admin_action(
+                    updated.get("country"),
+                    updated.get("therapeutic_area"),
+                    "update",
+                    f"SKU {updated.get('sku_id', '')} updated",
+                    pcr_id=None,
+                )
+            except Exception:
+                pass
+            try:
                 await database.log_audit(
                     user_id=x_user_id,
                     action="MDGM update",
@@ -300,6 +332,16 @@ async def delete_mdgm(
         if not existing:
             raise HTTPException(status_code=404, detail="MDGM row not found")
         existing_row = dict(existing)
+        try:
+            await notify_admin_action(
+                existing_row.get("country"),
+                existing_row.get("therapeutic_area"),
+                "deletion",
+                f"SKU {existing_row.get('sku_id', '')} removed",
+                pcr_id=None,
+            )
+        except Exception:
+            pass
         await conn.execute("DELETE FROM sku_mdgm_master WHERE id = ?", (row_id,))
         await conn.commit()
         try:
@@ -316,5 +358,169 @@ async def delete_mdgm(
         except Exception:
             pass
         return {"message": "MDGM row deleted", "id": row_id}
+    finally:
+        await conn.close()
+
+
+# ---- Admin: PCR actions (delete, update status/fields) ----
+
+@router.delete("/admin/pcrs/{pcr_id}")
+async def admin_delete_pcr(
+    pcr_id: str = Path(...),
+    x_user_id: int = Header(..., alias="X-User-Id"),
+):
+    """Delete a PCR. Admin only. Audit: PCR admin delete."""
+    await _require_admin(x_user_id)
+    conn = await database.get_connection()
+    try:
+        conn.row_factory = lambda c, r: dict(zip([col[0] for col in c.description], r))
+        async with conn.execute(
+            "SELECT pcr_id_display, country, therapeutic_area, product_skus FROM pcrs WHERE pcr_id_display = ?",
+            (pcr_id,),
+        ) as cur:
+            row = await cur.fetchone()
+        if not row:
+            raise HTTPException(status_code=404, detail="PCR not found")
+        row_d = dict(row)
+        try:
+            await notify_admin_action(
+                row_d.get("country"),
+                row_d.get("therapeutic_area"),
+                "deletion",
+                f"PCR {pcr_id} deleted",
+                pcr_id=pcr_id,
+            )
+        except Exception:
+            pass
+        await conn.execute("DELETE FROM pcrs WHERE pcr_id_display = ?", (pcr_id,))
+        await conn.commit()
+        sku_list = [s.strip() for s in (row_d.get("product_skus") or "").split(",") if s.strip()] if row_d.get("product_skus") else []
+        audit_brand = await get_brand_from_mdgm(sku_list[0], row_d.get("country"), row_d.get("therapeutic_area")) if sku_list and row_d.get("country") and row_d.get("therapeutic_area") else None
+        try:
+            await database.log_audit(
+                user_id=x_user_id,
+                action="PCR admin delete",
+                entity_type="pcr",
+                entity_id=pcr_id,
+                brand=audit_brand,
+                country=row_d.get("country"),
+                details=None,
+                sku_ids=sku_list or None,
+            )
+        except Exception:
+            pass
+        return {"message": "PCR deleted", "pcr_id": pcr_id}
+    finally:
+        await conn.close()
+
+
+@router.put("/admin/pcrs/{pcr_id}")
+async def admin_update_pcr(
+    pcr_id: str = Path(...),
+    request: AdminPCRUpdateRequest = Body(...),
+    x_user_id: int = Header(..., alias="X-User-Id"),
+):
+    """Update a PCR (status or other fields). Admin only. Audit: PCR admin update."""
+    await _require_admin(x_user_id)
+    updates, params = [], []
+    if request.status is not None:
+        updates.append("status = ?")
+        params.append(request.status.strip())
+    if request.proposed_price is not None:
+        updates.append("proposed_price = ?")
+        params.append(request.proposed_price.strip())
+    if request.product_name is not None:
+        updates.append("product_name = ?")
+        params.append(request.product_name.strip())
+    if request.product_id is not None:
+        updates.append("product_id = ?")
+        params.append(request.product_id.strip())
+    if request.current_price is not None:
+        updates.append("current_price = ?")
+        params.append(request.current_price.strip())
+    if request.country is not None:
+        updates.append("country = ?")
+        params.append(request.country.strip())
+    if request.therapeutic_area is not None:
+        updates.append("therapeutic_area = ?")
+        params.append(request.therapeutic_area.strip())
+    if request.product_skus is not None:
+        updates.append("product_skus = ?")
+        params.append(request.product_skus.strip())
+    if request.channel is not None:
+        updates.append("channel = ?")
+        params.append(request.channel.strip())
+    if request.price_type is not None:
+        updates.append("price_type = ?")
+        params.append(request.price_type.strip())
+    if request.effective_date is not None:
+        updates.append("effective_date = ?")
+        params.append(request.effective_date.strip())
+    if request.price_change_reason is not None:
+        updates.append("price_change_reason = ?")
+        params.append(request.price_change_reason.strip())
+    if request.price_change_reason_comments is not None:
+        updates.append("price_change_reason_comments = ?")
+        params.append(request.price_change_reason_comments.strip())
+    if not updates:
+        raise HTTPException(status_code=400, detail="Provide at least one field to update")
+    conn = await database.get_connection()
+    try:
+        conn.row_factory = lambda c, r: dict(zip([col[0] for col in c.description], r))
+        # Disallow editing finalised PCRs: any further change must go via a new PCR
+        async with conn.execute(
+            "SELECT status, country, therapeutic_area, product_skus FROM pcrs WHERE pcr_id_display = ?",
+            (pcr_id,),
+        ) as cur:
+            existing = await cur.fetchone()
+        if not existing:
+            raise HTTPException(status_code=404, detail="PCR not found")
+        if (existing.get("status") or "").strip() == "finalised":
+            raise HTTPException(
+                status_code=400,
+                detail="Finalised PCRs cannot be edited. Create a new PCR for further changes.",
+            )
+        updates.append("updated_at = CURRENT_TIMESTAMP")
+        params.append(pcr_id)
+        await conn.execute(
+            "UPDATE pcrs SET " + ", ".join(updates) + " WHERE pcr_id_display = ?",
+            tuple(params),
+        )
+        await conn.commit()
+        async with conn.execute(
+            "SELECT country, therapeutic_area, product_skus FROM pcrs WHERE pcr_id_display = ?",
+            (pcr_id,),
+        ) as cur:
+            after = await cur.fetchone()
+        pcr_country = after.get("country") if after else existing.get("country")
+        pcr_ta = after.get("therapeutic_area") if after else existing.get("therapeutic_area")
+        product_skus_str = after.get("product_skus") if after else existing.get("product_skus")
+        sku_list = [s.strip() for s in (product_skus_str or "").split(",") if s.strip()] if product_skus_str else []
+        audit_brand = await get_brand_from_mdgm(sku_list[0], pcr_country, pcr_ta) if sku_list and pcr_country and pcr_ta else None
+        details = "Admin updated: " + ", ".join(f.replace(" = ?", "") for f in updates if f != "updated_at = CURRENT_TIMESTAMP")
+        try:
+            await notify_admin_action(
+                pcr_country,
+                pcr_ta,
+                "update",
+                f"PCR {pcr_id} updated",
+                pcr_id=pcr_id,
+            )
+        except Exception:
+            pass
+        try:
+            await database.log_audit(
+                user_id=x_user_id,
+                action="PCR admin update",
+                entity_type="pcr",
+                entity_id=pcr_id,
+                brand=audit_brand,
+                country=pcr_country,
+                details=details,
+                sku_ids=sku_list or None,
+            )
+        except Exception:
+            pass
+        return {"message": "PCR updated by Admin", "pcr_id": pcr_id}
     finally:
         await conn.close()

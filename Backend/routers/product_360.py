@@ -22,13 +22,13 @@ async def _require_admin(x_user_id: int) -> None:
 
 
 async def _get_user_scope(user_id: int) -> dict | None:
-    """Return {role, country, therapeutic_area, region} for the user, or None if not found.
-    Used to enforce visibility: Local sees only their country, Regional only their region, Global/Admin see all."""
+    """Return {user_id, role, therapeutic_area, region} for the user, or None if not found.
+    Used to enforce visibility: Local sees only their assigned countries, Regional only their region, Global/Admin see all."""
     conn = await database.get_connection()
     try:
         conn.row_factory = lambda c, r: dict(zip([col[0] for col in c.description], r))
         async with conn.execute(
-            "SELECT role, country, therapeutic_area, region FROM users WHERE id = ?",
+            "SELECT id AS user_id, role, therapeutic_area, region FROM users WHERE id = ?",
             (user_id,),
         ) as cur:
             row = await cur.fetchone()
@@ -38,25 +38,43 @@ async def _get_user_scope(user_id: int) -> dict | None:
 
 
 async def _ensure_can_access_country(scope: dict | None, country: str | None) -> None:
-    """Raise 403 if scope is set and user cannot access this country. Call when endpoint uses country."""
+    """Raise 403 if scope is set and user cannot access this country."""
     if not scope or not country or not (country or "").strip():
         return
     role = (scope.get("role") or "").strip()
     if role in ("Admin", "Global"):
         return
+    country = (country or "").strip()
+    user_id = scope.get("user_id")
     if role == "Local":
-        if (scope.get("country") or "").strip() != (country or "").strip():
-            raise HTTPException(status_code=403, detail="You can only access data for your country")
+        # Local: must have this country in user_countries
+        conn = await database.get_connection()
+        try:
+            async with conn.execute(
+                "SELECT 1 FROM user_countries WHERE user_id = ? AND country = ? LIMIT 1",
+                (user_id, country),
+            ) as cur:
+                if not await cur.fetchone():
+                    raise HTTPException(
+                        status_code=403,
+                        detail="You can only access data for your assigned countries",
+                    )
+        finally:
+            await conn.close()
         return
     if role == "Regional":
+        # Regional: country must be in their region (via countries table)
         conn = await database.get_connection()
         try:
             async with conn.execute(
                 "SELECT 1 FROM countries WHERE code = ? AND region = ?",
-                ((country or "").strip(), (scope.get("region") or "").strip()),
+                (country, (scope.get("region") or "").strip()),
             ) as cur:
                 if not await cur.fetchone():
-                    raise HTTPException(status_code=403, detail="You can only access data for countries in your region")
+                    raise HTTPException(
+                        status_code=403,
+                        detail="You can only access data for countries in your region",
+                    )
         finally:
             await conn.close()
 
@@ -74,17 +92,19 @@ async def list_regions(
         conn.row_factory = lambda c, r: dict(zip([col[0] for col in c.description], r))
         if scope:
             role = (scope.get("role") or "").strip()
+            user_id = scope.get("user_id")
             if role == "Local":
-                user_country = (scope.get("country") or "").strip()
-                if user_country:
-                    async with conn.execute(
-                        "SELECT code, name FROM regions r WHERE EXISTS (SELECT 1 FROM countries c WHERE c.region = r.code AND c.code = ?) ORDER BY name",
-                        (user_country,),
-                    ) as cur:
-                        rows = await cur.fetchall()
-                else:
-                    async with conn.execute("SELECT code, name FROM regions ORDER BY name") as cur:
-                        rows = await cur.fetchall()
+                # Regions for which the user has at least one assigned country
+                async with conn.execute(
+                    """SELECT DISTINCT r.code, r.name
+                       FROM regions r
+                       JOIN countries c ON c.region = r.code
+                       JOIN user_countries uc ON uc.country = c.code
+                       WHERE uc.user_id = ?
+                       ORDER BY r.name""",
+                    (user_id,),
+                ) as cur:
+                    rows = await cur.fetchall()
             elif role == "Regional":
                 user_region = (scope.get("region") or "").strip()
                 if user_region:
@@ -112,61 +132,81 @@ async def list_countries(
     region: str = Query(None, description="Optional: filter by region code (e.g. APAC, EMEA)"),
     x_user_id: Optional[int] = Header(None, alias="X-User-Id"),
 ):
-    """List countries. Send X-User-Id: Local sees only their country, Regional only countries in their region, Admin/Global see all (optionally filtered by region param)."""
+    """List countries.
+    Visibility:
+      - Local: only countries assigned in user_countries.
+      - Regional: only countries in their region.
+      - Global/Admin/anonymous: all countries (optionally filtered by region).
+    """
     scope = await _get_user_scope(x_user_id) if x_user_id else None
     conn = await database.get_connection()
     try:
         conn.row_factory = lambda c, r: dict(zip([col[0] for col in c.description], r))
         if scope:
             role = (scope.get("role") or "").strip()
+            user_id = scope.get("user_id")
+            user_region = (scope.get("region") or "").strip()
             if role == "Local":
-                user_country = (scope.get("country") or "").strip()
-                if user_country:
+                # Local: only assigned countries from user_countries
+                if region:
                     async with conn.execute(
-                        "SELECT id, code, name, region FROM countries WHERE code = ? ORDER BY name",
-                        (user_country,),
+                        """SELECT c.code, c.name, c.region
+                           FROM countries c
+                           JOIN user_countries uc ON uc.country = c.code
+                           WHERE uc.user_id = ? AND c.region = ?
+                           ORDER BY c.name""",
+                        (user_id, region),
                     ) as cur:
                         rows = await cur.fetchall()
                 else:
                     async with conn.execute(
-                        "SELECT id, code, name, region FROM countries ORDER BY region, name",
+                        """SELECT c.code, c.name, c.region
+                           FROM countries c
+                           JOIN user_countries uc ON uc.country = c.code
+                           WHERE uc.user_id = ?
+                           ORDER BY c.name""",
+                        (user_id,),
                     ) as cur:
                         rows = await cur.fetchall()
             elif role == "Regional":
-                user_region = (scope.get("region") or "").strip()
-                if user_region:
+                # Regional: only countries in their region
+                effective_region = region.strip() if region else user_region
+                if not effective_region:
+                    # No region info; fallback to all countries (unlikely)
                     async with conn.execute(
-                        "SELECT id, code, name, region FROM countries WHERE region = ? ORDER BY name",
-                        (user_region,),
+                        "SELECT code, name, region FROM countries ORDER BY name"
                     ) as cur:
                         rows = await cur.fetchall()
                 else:
                     async with conn.execute(
-                        "SELECT id, code, name, region FROM countries ORDER BY region, name",
+                        "SELECT code, name, region FROM countries WHERE region = ? ORDER BY name",
+                        (effective_region,),
                     ) as cur:
                         rows = await cur.fetchall()
             else:
+                # Global/Admin: all countries (optionally filtered by region)
                 if region:
                     async with conn.execute(
-                        "SELECT id, code, name, region FROM countries WHERE region = ? ORDER BY name",
+                        "SELECT code, name, region FROM countries WHERE region = ? ORDER BY name",
                         (region,),
                     ) as cur:
                         rows = await cur.fetchall()
                 else:
                     async with conn.execute(
-                        "SELECT id, code, name, region FROM countries ORDER BY region, name",
+                        "SELECT code, name, region FROM countries ORDER BY name"
                     ) as cur:
                         rows = await cur.fetchall()
         else:
+            # No user scope: return all countries (optionally filtered by region)
             if region:
                 async with conn.execute(
-                    "SELECT id, code, name, region FROM countries WHERE region = ? ORDER BY name",
+                    "SELECT code, name, region FROM countries WHERE region = ? ORDER BY name",
                     (region,),
                 ) as cur:
                     rows = await cur.fetchall()
             else:
                 async with conn.execute(
-                    "SELECT id, code, name, region FROM countries ORDER BY region, name",
+                    "SELECT code, name, region FROM countries ORDER BY name"
                 ) as cur:
                     rows = await cur.fetchall()
         return {"countries": [dict(r) for r in rows]}
@@ -187,47 +227,45 @@ async def list_therapeutic_areas(
         conn.row_factory = lambda c, r: dict(zip([col[0] for col in c.description], r))
         if scope:
             role = (scope.get("role") or "").strip()
+            user_id = scope.get("user_id")
             if role == "Local":
-                user_country = (scope.get("country") or "").strip()
-                user_ta = (scope.get("therapeutic_area") or "").strip()
-                effective_country = (country or "").strip() or user_country
-                if user_country and effective_country and effective_country != user_country:
-                    raise HTTPException(status_code=403, detail="You can only view therapeutic areas for your country")
-                effective_country = effective_country or user_country
+                # Local: country must be one of their assigned countries (if specified)
+                requested_country = (country or "").strip()
+                if requested_country:
+                    conn_check = await database.get_connection()
+                    try:
+                        async with conn_check.execute(
+                            "SELECT 1 FROM user_countries WHERE user_id = ? AND country = ? LIMIT 1",
+                            (user_id, requested_country),
+                        ) as cur2:
+                            if not await cur2.fetchone():
+                                raise HTTPException(
+                                    status_code=403,
+                                    detail="You can only view therapeutic areas for your assigned countries",
+                                )
+                    finally:
+                        await conn_check.close()
+                effective_country = requested_country or None
+
                 if effective_country:
-                    if user_ta:
-                        async with conn.execute(
-                            """SELECT DISTINCT m.therapeutic_area
-                               FROM sku_mdgm_master m
-                               WHERE m.country = ? AND m.therapeutic_area = ?
-                               ORDER BY m.therapeutic_area""",
-                            (effective_country, user_ta),
-                        ) as cur:
-                            rows = await cur.fetchall()
-                    else:
-                        async with conn.execute(
-                            """SELECT DISTINCT m.therapeutic_area
-                               FROM sku_mdgm_master m
-                               WHERE m.country = ?
-                               ORDER BY m.therapeutic_area""",
-                            (effective_country,),
-                        ) as cur:
-                            rows = await cur.fetchall()
+                    async with conn.execute(
+                        """SELECT DISTINCT m.therapeutic_area
+                           FROM sku_mdgm_master m
+                           WHERE m.country = ?
+                           ORDER BY m.therapeutic_area""",
+                        (effective_country,),
+                    ) as cur:
+                        rows = await cur.fetchall()
                 else:
-                    if user_ta:
-                        async with conn.execute(
-                            """SELECT DISTINCT therapeutic_area FROM sku_mdgm_master
-                               WHERE therapeutic_area = ?
-                               ORDER BY therapeutic_area""",
-                            (user_ta,),
-                        ) as cur:
-                            rows = await cur.fetchall()
-                    else:
-                        async with conn.execute(
-                            """SELECT DISTINCT therapeutic_area FROM sku_mdgm_master
-                               ORDER BY therapeutic_area""",
-                        ) as cur:
-                            rows = await cur.fetchall()
+                    # All TAs across all assigned countries
+                    async with conn.execute(
+                        """SELECT DISTINCT m.therapeutic_area
+                           FROM sku_mdgm_master m
+                           WHERE m.country IN (SELECT country FROM user_countries WHERE user_id = ?)
+                           ORDER BY m.therapeutic_area""",
+                        (user_id,),
+                    ) as cur:
+                        rows = await cur.fetchall()
             elif role == "Regional":
                 user_region = (scope.get("region") or "").strip()
                 if country and user_region:
@@ -337,12 +375,26 @@ async def list_brands(
     scope = await _get_user_scope(x_user_id) if x_user_id else None
     if scope:
         role = (scope.get("role") or "").strip()
-        user_country = (scope.get("country") or "").strip()
+        user_id = scope.get("user_id")
         user_region = (scope.get("region") or "").strip()
-        user_ta = (scope.get("therapeutic_area") or "").strip()
+        # user_ta = (scope.get("therapeutic_area") or "").strip()
+        user_ta = None
         if role == "Local":
-            if user_country and (country or "").strip() != user_country:
-                raise HTTPException(status_code=403, detail="You can only view brands for your country")
+            # Local: requested country must be one of their assigned countries
+            requested_country = (country or "").strip()
+            conn_check = await database.get_connection()
+            try:
+                async with conn_check.execute(
+                    "SELECT 1 FROM user_countries WHERE user_id = ? AND country = ? LIMIT 1",
+                    (user_id, requested_country),
+                ) as cur2:
+                    if not await cur2.fetchone():
+                        raise HTTPException(
+                            status_code=403,
+                            detail="You can only view brands for your assigned countries",
+                        )
+            finally:
+                await conn_check.close()
         if role == "Regional" and user_region:
             conn_check = await database.get_connection()
             try:
@@ -355,10 +407,10 @@ async def list_brands(
             finally:
                 await conn_check.close()
         # Scope by therapeutic area for Local and Regional users when they have a TA set
-        if role in ("Local", "Regional") and user_ta:
-            if therapeutic_area and (therapeutic_area or "").strip() != user_ta:
-                raise HTTPException(status_code=403, detail="You can only view brands for your therapeutic area")
-            therapeutic_area = user_ta
+        # if role in ("Local", "Regional") and user_ta:
+        #     # if therapeutic_area and (therapeutic_area or "").strip() != user_ta:
+        #     #     raise HTTPException(status_code=403, detail="You can only view brands for your therapeutic area")
+        #     therapeutic_area = user_ta
     conn = await database.get_connection()
     try:
         conn.row_factory = lambda c, r: dict(zip([col[0] for col in c.description], r))
@@ -399,12 +451,26 @@ async def list_skus(
     scope = await _get_user_scope(x_user_id) if x_user_id else None
     if scope:
         role = (scope.get("role") or "").strip()
-        user_country = (scope.get("country") or "").strip()
+        user_id = scope.get("user_id")
         user_region = (scope.get("region") or "").strip()
-        user_ta = (scope.get("therapeutic_area") or "").strip()
+        # user_ta = (scope.get("therapeutic_area") or "").strip()
+        user_ta = None
         if role == "Local":
-            if user_country and (country or "").strip() != user_country:
-                raise HTTPException(status_code=403, detail="You can only view SKUs for your country")
+            # Local: requested country must be one of their assigned countries
+            requested_country = (country or "").strip()
+            conn_check = await database.get_connection()
+            try:
+                async with conn_check.execute(
+                    "SELECT 1 FROM user_countries WHERE user_id = ? AND country = ? LIMIT 1",
+                    (user_id, requested_country),
+                ) as cur2:
+                    if not await cur2.fetchone():
+                        raise HTTPException(
+                            status_code=403,
+                            detail="You can only view SKUs for your assigned countries",
+                        )
+            finally:
+                await conn_check.close()
         if role == "Regional" and user_region:
             conn_check = await database.get_connection()
             try:
@@ -417,10 +483,10 @@ async def list_skus(
             finally:
                 await conn_check.close()
         # Scope by therapeutic area for Local and Regional users when they have a TA set
-        if role in ("Local", "Regional") and user_ta:
-            if therapeutic_area and (therapeutic_area or "").strip() != user_ta:
-                raise HTTPException(status_code=403, detail="You can only view SKUs for your therapeutic area")
-            therapeutic_area = user_ta
+        # if role in ("Local", "Regional") and user_ta:
+        #     # if therapeutic_area and (therapeutic_area or "").strip() != user_ta:
+        #     #     raise HTTPException(status_code=403, detail="You can only view SKUs for your therapeutic area")
+        #     therapeutic_area = user_ta
     conn = await database.get_connection()
     try:
         conn.row_factory = lambda c, r: dict(zip([col[0] for col in c.description], r))
@@ -469,11 +535,12 @@ async def get_overview(
     scope = await _get_user_scope(x_user_id) if x_user_id else None
     if scope:
         role = (scope.get("role") or "").strip()
-        user_ta = (scope.get("therapeutic_area") or "").strip()
-        if role in ("Local", "Regional") and user_ta:
-            if therapeutic_area and (therapeutic_area or "").strip() != user_ta:
-                raise HTTPException(status_code=403, detail="You can only access data for your therapeutic area")
-            therapeutic_area = user_ta
+        # user_ta = (scope.get("therapeutic_area") or "").strip()
+        user_ta = None
+        # if role in ("Local", "Regional") and user_ta:
+        #     # if therapeutic_area and (therapeutic_area or "").strip() != user_ta:
+        #     #     raise HTTPException(status_code=403, detail="You can only access data for your therapeutic area")
+        #     therapeutic_area = user_ta
     await _ensure_can_access_country(scope, country)
     effective_ta = therapeutic_area or await get_therapeutic_area_for_brand(brand)
 
@@ -561,11 +628,12 @@ async def get_pricing(
     scope = await _get_user_scope(x_user_id) if x_user_id else None
     if scope:
         role = (scope.get("role") or "").strip()
-        user_ta = (scope.get("therapeutic_area") or "").strip()
-        if role in ("Local", "Regional") and user_ta:
-            if therapeutic_area and (therapeutic_area or "").strip() != user_ta:
-                raise HTTPException(status_code=403, detail="You can only access pricing for your therapeutic area")
-            therapeutic_area = user_ta
+        # user_ta = (scope.get("therapeutic_area") or "").strip()
+        user_ta = None
+        # if role in ("Local", "Regional") and user_ta:
+        #     # if therapeutic_area and (therapeutic_area or "").strip() != user_ta:
+        #     #     raise HTTPException(status_code=403, detail="You can only access pricing for your therapeutic area")
+        #     therapeutic_area = user_ta
     await _ensure_can_access_country(scope, country)
     currency = currency.strip() if currency else None
     target_fx_date = target_fx_date.strip() if target_fx_date else None
@@ -687,11 +755,12 @@ async def get_mdgm_details(
     scope = await _get_user_scope(x_user_id) if x_user_id else None
     if scope:
         role = (scope.get("role") or "").strip()
-        user_ta = (scope.get("therapeutic_area") or "").strip()
-        if role in ("Local", "Regional") and user_ta:
-            if therapeutic_area and (therapeutic_area or "").strip() != user_ta:
-                raise HTTPException(status_code=403, detail="You can only view MDGM details for your therapeutic area")
-            therapeutic_area = user_ta
+        # user_ta = (scope.get("therapeutic_area") or "").strip()
+        user_ta = None
+        # if role in ("Local", "Regional") and user_ta:
+        #     # if therapeutic_area and (therapeutic_area or "").strip() != user_ta:
+        #     #     raise HTTPException(status_code=403, detail="You can only view MDGM details for your therapeutic area")
+        #     therapeutic_area = user_ta
     await _ensure_can_access_country(scope, country)
     ta = therapeutic_area or await get_therapeutic_area_for_brand(brand)
     conn = await database.get_connection()
@@ -739,31 +808,61 @@ async def get_audit_trail(
     x_user_id: int = Header(..., alias="X-User-Id"),
     brand: Optional[str] = Query(None, description="Filter by brand (product name)"),
     country: Optional[str] = Query(None, description="Filter by country"),
-    sku_id: Optional[str] = Query(None, description="When admin selects a SKU: return only that SKU's audit log"),
+    sku_id: Optional[str] = Query(None, description="When selecting a SKU: return only that SKU's audit log"),
     limit: Optional[int] = Query(None, ge=1, le=10000, description="Optional max entries; omit to return all"),
 ):
     """
-    AUDIT TRAIL tab: Admin only. Audit is stored per SKU; when sku_id is passed we return rows for that SKU only.
-    Optionally narrow by brand and/or country. No limit by default (returns all matching rows).
+    AUDIT TRAIL tab in Product 360.
+    Visibility:
+      - Local: only audit entries for their country.
+      - Regional: only audit entries for countries in their region.
+      - Global/Admin: all countries/regions.
+    Filters:
+      - brand: filters on a.brand (exact or prefix).
+      - country: must be within user's scope (enforced by _ensure_can_access_country).
+      - sku_id: filters on a.sku_id.
     """
-    await _require_admin(x_user_id)
-    conditions = []
+    # Get user scope
+    scope = await _get_user_scope(x_user_id)
+    if not scope:
+        raise HTTPException(status_code=400, detail="User not found")
+    role = (scope.get("role") or "").strip()
+    user_region = (scope.get("region") or "").strip()
+    conditions: list[str] = []
     params: list = []
+    # Brand filter (same as before)
     if brand:
-        # Match exact brand (e.g. EUTHYROX) or legacy product_name stored as brand (e.g. EUTHYROX 100mcg)
         conditions.append("(a.brand = ? OR a.brand LIKE ?)")
         params.extend([brand, brand + "%"])
-    if country:
-        conditions.append("a.country = ?")
-        params.append(country)
+    # SKU filter (same as before)
     if sku_id:
         conditions.append("a.sku_id = ?")
         params.append(sku_id)
-
-    where_clause = " WHERE " + " AND ".join(conditions) if conditions else ""
-    limit_clause = " LIMIT ?" if limit is not None else ""
+    # Country / scope filter
+    if country:
+        # Enforce that the user is allowed to see this country
+        await _ensure_can_access_country(scope, country)
+        conditions.append("a.country = ?")
+        params.append(country)
+    else:
+        # No explicit country param: restrict by scope for Local and Regional
+        if role == "Local":
+            conditions.append(
+                "a.country IN (SELECT country FROM user_countries WHERE user_id = ?)"
+            )
+            params.append(scope.get("user_id"))
+        elif role == "Regional" and user_region:
+            conditions.append(
+                "EXISTS (SELECT 1 FROM countries c WHERE c.code = a.country AND c.region = ?)"
+            )
+            params.append(user_region)
+        # Global/Admin: no extra country restriction
+    # Optional limit
+    limit_clause = ""
     if limit is not None:
+        limit_clause = " LIMIT ?"
         params.append(limit)
+    where_clause = " WHERE " + " AND ".join(conditions) if conditions else ""
     q = (
         """SELECT a.id, a.created_at, a.user_id, a.action, a.entity_type, a.entity_id, a.brand, a.country, a.details, a.sku_id,
            u.name AS user_name, u.email AS user_email
@@ -781,4 +880,3 @@ async def get_audit_trail(
         return {"audit_entries": [dict(r) for r in rows]}
     finally:
         await conn.close()
-

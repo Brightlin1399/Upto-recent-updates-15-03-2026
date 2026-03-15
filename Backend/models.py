@@ -7,6 +7,7 @@ class SubmitPCRRequest(BaseModel):
     country: str
     brand: str
     product_skus: list[str] = []
+    attachments: list[str] = []  # optional: presigned URLs attached at submission time
     product_name: Optional[str] = None
     product_id: Optional[str] = None
     proposed_price: Optional[str] = None
@@ -57,6 +58,8 @@ class ResubmitPCRRequest(BaseModel):
     re_submitted_by:int
 class EscalateToGlobalRequest(BaseModel):
     escalated_by: int
+    attachments: list[str] = []  # mandatory: list of presigned URLs for escalation attachments
+    comments: Optional[str] = None
 class MessageResponse(BaseModel):
     message:str
     pcr_id:str
@@ -76,25 +79,6 @@ class SendMessageRequest(BaseModel):
 class FinalisePCRRequest(BaseModel):
     finalised_by: int
     published: Optional[bool] = None  # yes/no; logic to set/use it will be implemented later
-
-
-# Admin user management
-class CreateUserRequest(BaseModel):
-    name: str
-    email: str
-    role: str  # Local | Regional | Global | Admin
-    country: Optional[str] = None
-    therapeutic_area: Optional[str] = None
-    region: Optional[str] = None
-
-
-class UpdateUserRequest(BaseModel):
-    name: Optional[str] = None
-    email: Optional[str] = None
-    role: Optional[str] = None  # Local | Regional | Global | Admin
-    country: Optional[str] = None
-    therapeutic_area: Optional[str] = None
-    region: Optional[str] = None
 
 
 # Master data: Admin CRUD on sku_mdgm_master (create/update/delete SKU rows).
@@ -125,6 +109,23 @@ class CreateMDGMRequest(BaseModel):
     reimbursement_rate: Optional[float] = None
     marketed_status: Optional[str] = None
     current_price_eur: Optional[float] = None
+
+
+class AdminPCRUpdateRequest(BaseModel):
+    """Admin: update a PCR (e.g. status, proposed_price). All fields optional."""
+    status: Optional[str] = None  # e.g. draft, local_approved, regional_approved, escalated_to_global, global_approved, finalised
+    proposed_price: Optional[str] = None
+    product_name: Optional[str] = None
+    product_id: Optional[str] = None
+    current_price: Optional[str] = None
+    country: Optional[str] = None
+    therapeutic_area: Optional[str] = None
+    product_skus: Optional[str] = None
+    channel: Optional[str] = None
+    price_type: Optional[str] = None
+    effective_date: Optional[str] = None
+    price_change_reason: Optional[str] = None
+    price_change_reason_comments: Optional[str] = None
 
 
 class UpdateMDGMRequest(BaseModel):

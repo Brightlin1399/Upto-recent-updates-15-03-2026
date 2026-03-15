@@ -162,13 +162,13 @@ async def _user_can_approve_for_pcr(user_id: int, pcr_id: str) -> bool:
             pcr[3],
         )
         async with conn.execute(
-            "SELECT role, country, therapeutic_area, region FROM users WHERE id = ?",
+            "SELECT role, therapeutic_area, region FROM users WHERE id = ?",
             (user_id,),
         ) as cur:
             user = await cur.fetchone()
         if not user:
             return False
-        role, user_country, user_ta, user_region = user[0], user[1], user[2], user[3]
+        role, user_ta, user_region = user[0], user[1], user[2]
         if role == "Admin":
             return False
         if role == "Global":
@@ -261,18 +261,25 @@ async def get_current_price_eur(
 
 
 async def run_submit_approval_flow(pcr_id_display: str, submitted_by: int) -> dict:
-    """Require current price per SKU; set status to local_approved (Local approved, sent to Regional). No auto-approval, no floor checks."""
+    """Require current price per SKU; set status to local_approved (Local approved, sent to Regional).
+
+    For explicit price_change_type values we enforce direction vs current price:
+      - 'Price Increase'  : proposed_price_eur must be > current_price_eur for every SKU.
+      - 'Price Decrease'  : proposed_price_eur must be < current_price_eur for every SKU.
+    Other types (De-Listing, Re-Pricing, New Product Launch) currently have no extra direction checks here.
+    No auto-approval or floor checks are applied here.
+    """
     conn = await database.get_connection()
     try:
         async with conn.execute(
-            """SELECT proposed_price, product_skus, country, therapeutic_area, channel, price_type, product_name
+            """SELECT proposed_price, product_skus, country, therapeutic_area, channel, price_type, product_name, price_change_type
                FROM pcrs WHERE pcr_id_display = ?""",
             (pcr_id_display,),
         ) as cur:
             row = await cur.fetchone()
         if not row:
             raise HTTPException(status_code=404, detail="PCR not found")
-        proposed_price, product_skus_str, country, therapeutic_area, channel, price_type, product_name = (
+        proposed_price, product_skus_str, country, therapeutic_area, channel, price_type, product_name, price_change_type = (
             row[0],
             row[1],
             row[2],
@@ -280,9 +287,11 @@ async def run_submit_approval_flow(pcr_id_display: str, submitted_by: int) -> di
             row[4],
             row[5],
             row[6] if len(row) > 6 else None,
+            row[7] if len(row) > 7 else None,
         )
         channel = (channel or "Retail").strip() if channel else "Retail"
         proposed_eur = _parse_price(proposed_price)
+        pct_clean = (price_change_type or "").strip()
 
         # Determine classification across all SKUs in this PCR
         sku_list: list[str] = []
@@ -307,6 +316,27 @@ async def run_submit_approval_flow(pcr_id_display: str, submitted_by: int) -> di
                     status_code=400,
                     detail=f"SKU '{sku_id}' has no current price (country={country}, channel={channel}, price_type={price_type}). Add MDGM or history before submitting.",
                 )
+            # Enforce basic price-change direction for explicit types
+            if pct_clean == "Price Increase":
+                if proposed_eur <= current_eur:
+                    raise HTTPException(
+                        status_code=400,
+                        detail=(
+                            f"Price Change Type is '{price_change_type}'. "
+                            f"Proposed price must be greater than current price for SKU '{sku_id}'. "
+                            f"Current={current_eur}, proposed={proposed_eur}."
+                        ),
+                    )
+            elif pct_clean == "Price Decrease":
+                if proposed_eur >= current_eur:
+                    raise HTTPException(
+                        status_code=400,
+                        detail=(
+                            f"Price Change Type is '{price_change_type}'. "
+                            f"Proposed price must be lower than current price for SKU '{sku_id}'. "
+                            f"Current={current_eur}, proposed={proposed_eur}."
+                        ),
+                    )
 
         # Always: Local approved, goes to Regional (no auto-approval, no floor-based logic)
         await conn.execute(

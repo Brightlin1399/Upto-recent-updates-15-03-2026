@@ -2,7 +2,7 @@ from contextlib import asynccontextmanager
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 import database
-from routers import health, users, chats, pcrs, notifications, admin, product_360
+from routers import health, users, chats, pcrs, notifications, admin, product_360, presign
 
 
 @asynccontextmanager
@@ -28,6 +28,7 @@ app.include_router(pcrs.router, prefix="/api")
 app.include_router(notifications.router, prefix="/api")
 app.include_router(admin.router, prefix="/api")
 app.include_router(product_360.router, prefix="/api")
+app.include_router(presign.router, prefix="/api")
 
 
 if __name__ == "__main__":

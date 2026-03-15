@@ -11,12 +11,13 @@ async def get_user_notifications(user_id: int = Path(...)):
         async with conn.execute("""
             SELECT n.*, p.product_name, p.status as pcr_status, p.pcr_id_display
             FROM notifications n
-            JOIN pcrs p ON n.pcr_id = p.pcr_id_display
+            LEFT JOIN pcrs p ON n.pcr_id = p.pcr_id_display
             WHERE n.user_id = ?
             ORDER BY n.created_at DESC
             LIMIT 50
         """, (user_id,)) as cur:
             notifications = await cur.fetchall()
+        # For admin/MDGM notifications, pcr_id is NULL so p.* columns are NULL
         return {"notifications": [dict(row) for row in notifications]}
     finally:
         await conn.close()

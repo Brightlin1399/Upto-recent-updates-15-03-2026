@@ -16,7 +16,7 @@ Plain text. Copy-paste friendly. No special characters.
 
   - Stack: FastAPI (app.py), SQLite via aiosqlite (database.py), notification_rules.py, models.py.
   - All DB access and route handlers are async (async def / await).
-  - Roles: Local, Regional, Global, Admin. Local sees only their country's PCRs; Regional their region's; Global only escalated PCRs.
+  - Roles: Local, Regional, Global, Admin. Local sees only their country's PCRs; Regional their region's; Global sees PCRs with status escalated_to_global (can act) and global_approved (view-only after approval).
   - Current price: from sku_price_history (latest effective_from <= date). Floor: from sku_mdgm_master. On finalise (Local only) we INSERT into sku_price_history only; no sku_channel_prices write.
 
 
@@ -45,7 +45,7 @@ Plain text. Copy-paste friendly. No special characters.
     users.py         GET /api/users (all users); Admin-only POST/PUT/DELETE /api/users for user management (X-User-Id, Admin role).
     admin.py         Admin-only master data: SKUs, channels, brand-therapeutic_area, floor prices. All require X-User-Id header, Admin role.
     chats.py         Exposes chat endpoints: create/get direct chat, list user's chats, get messages, send message; uses chat_helpers and requires X-User-Id.
-    pcrs.py          Exposes all PCR endpoints (submit, approve/reject, get, update, regional-edit, finalise, resubmit) plus product-by-name history, SKU history, and current price; uses pcr_helpers and notification_rules.
+    pcrs.py          Exposes all PCR endpoints (submit, approve/reject, get, update, finalise, resubmit) plus product-by-name history, SKU history, and current price. Regional cannot edit PCRs; only Local can update. Uses pcr_helpers and notification_rules.
     product_360.py   Product 360: regions, countries, brands (by country), overview (marketed + PCR count), pricing (single query, no N+1); uses get_therapeutic_area_for_brand.
     notifications.py Exposes GET user notifications, PUT mark one read, PUT mark all read for a user.
 
@@ -116,13 +116,13 @@ Plain text. Copy-paste friendly. No special characters.
 --------------------------------------------------------------------------------
 
   Submit          Only Local (own country+TA). All PCRs -> local_approved (Regional path). Notifications to submitter and Regional (same region). No auto-approval, no floor.
-  Regional approve  Status = local_approved -> regional_approved, store regional_approved_price_eur. Regional reject -> status = draft, back to Local. No floor-based escalation.
-  Global approve/reject  Only when status = escalated_to_global. Approve -> global_approved; Reject -> status = draft.
+  Regional approve  Status = local_approved -> regional_approved, store regional_approved_price_eur. Regional reject -> status = regional_rejected, back to Local.
+  Escalate to Global  Regional only. Regional can escalate without approving: allowed when status = local_approved or regional_approved -> escalated_to_global; notifies Global users. Audit: PCR escalated to Global. Mandatory: attachments (list of presigned URLs).
+  Global approve/reject  Only when status = escalated_to_global. Approve -> global_approved; Reject -> status = global_rejected, back to Local.
   Save as draft   Only Local. POST /pcrs with save_as_draft: true creates status = draft.
-  Update PCR      Only Local (own country+TA). Status = draft, rejected, local_approved, or regional_approved. Regional cannot full update or resubmit.
-  Regional edit   Only Regional (same region as PCR). Status = regional_approved. Metadata only (no proposed_price).
-  Finalise        Only Local (own country+TA). Status = regional_approved or global_approved. Re-checks vs approved price; INSERT sku_price_history only.
-  Resubmit        Only Local (own country+TA). Status = draft or rejected. -> submitted, approvers cleared; runs submit flow again.
+  Update PCR      Only Local (own country+TA). Status = draft, regional_rejected, global_rejected, local_approved, regional_approved, or global_approved. X-User-Id must equal edited_by. Regional cannot edit or resubmit.
+  Finalise        Only Local (own country+TA). Status = regional_approved or global_approved. X-User-Id must equal finalised_by. Re-checks vs approved price; INSERT sku_price_history only.
+  Resubmit        Only Local (own country+TA). Status = draft, regional_rejected, or global_rejected. X-User-Id must equal re_submitted_by. -> submitted then submit flow (local_approved); approvers cleared.
 
 
 --------------------------------------------------------------------------------
@@ -171,13 +171,13 @@ Plain text. Copy-paste friendly. No special characters.
 --------------------------------------------------------------------------------
 
   SubmitPCRRequest
-    Body for creating a PCR: submitted_by, pcr_id, country, brand, product_skus required; rest optional (product_name, prices, dates, etc.).
+    Body for creating a PCR: submitted_by, pcr_id, country, brand, product_skus required; optional attachments (list[str] of presigned URLs), plus other optional fields (product_name, prices, dates, etc.).
   ApproveRejectRequest
     Body for approve/reject endpoints: approved_by (int) for approve, rejected_by (int) for reject.
+  EscalateToGlobalRequest
+    Body for escalate-to-global: escalated_by (int, Regional user id), attachments (list[str] of presigned URLs, mandatory), comments (optional str).
   UpdatePCRRequest
-    Body for updating a rejected PCR: edited_by required; optional fields for product and price metadata.
-  RegionalEditPCRRequest
-    Body for Regional edit after approval: edited_by required; optional metadata only (no proposed_price or current_price).
+    Body for updating a rejected PCR: edited_by required; optional fields for product and price metadata. Only Local can update; Regional cannot edit.
   FinalisePCRRequest
     Body for finalise: finalised_by (user id of Local user; only Local can finalise).
   ResubmitPCRRequest
@@ -216,37 +216,38 @@ Plain text. Copy-paste friendly. No special characters.
   --- PCRs: create and read ---
   POST  /api/pcrs
         Creates a new PCR; only Local users can submit, and only for their own country and therapeutic area; triggers notifications to Local (same country+TA).
-        Body: submitted_by (int), pcr_id (str), country (str), brand (str), product_skus (list). Optional: product_name, product_id, current_price, proposed_price, price_change_type, expected_response_date, price_change_reason, price_change_reason_comments, submission_context, proposed_percent, is_discontinue_price, effective_date.
+        Body: submitted_by (int), pcr_id (str), country (str), brand (str), product_skus (list). Optional: attachments (list[str] of presigned URLs), product_name, product_id, current_price, proposed_price, price_change_type, expected_response_date, price_change_reason, price_change_reason_comments, submission_context, proposed_percent, is_discontinue_price, effective_date.
         Response 201: {"message": "PCR submitted successfully", "pcr_id": "..."}
 
   GET   /api/pcrs
-        Returns PCRs filtered by role: Local = own country; Regional = own region; Global = only escalated_to_global; Admin = all. Submitter and approver names joined.
+        Returns PCRs filtered by role: Local = own country; Regional = own region; Global = status in {escalated_to_global, global_approved} (Global acts only on escalated_to_global but can view PCRs they have approved); Admin = all. Submitter and approver names joined (including global_approver_name). escalation_attachments as array of presigned URLs per PCR.
         Response: {"pcrs": [{...}, ...]}
 
   GET   /api/pcrs/{pcr_id}
-        Returns a single PCR by its display id (e.g. PCR-001) with submitter and approver names; 404 if not found.
+        Returns a single PCR by its display id (e.g. PCR-001) with submitter and approver names (local_approver_name, regional_approver_name, global_approver_name). escalation_attachments is an array of presigned URLs (empty if none). Optional X-User-Id enforces visibility: Global gets 403 unless status in {escalated_to_global, global_approved}. 404 if not found.
         Response: {...} or 404
 
   --- PCRs: approval ---
   PUT   /api/pcrs/{pcr_id}/regional-approve
         Regional user approves the PCR; status must be local_approved. Status -> regional_approved. Body: {"approved_by": <user_id>}
   PUT   /api/pcrs/{pcr_id}/regional-reject
-        Regional user rejects the PCR; status becomes draft, back to Local. Body: {"rejected_by": <user_id>}
+        Regional user rejects the PCR; status becomes regional_rejected, back to Local. Body: {"rejected_by": <user_id>}
+
+  PUT   /api/pcrs/{pcr_id}/escalate-to-global
+        Regional user escalates to Global (without having to approve first). Allowed when status = local_approved or regional_approved.
+        Body: {"escalated_by": <user_id>, "attachments": ["<presigned_url_1>", "<presigned_url_2>"], "comments": "optional"}.
+        Audit: PCR escalated to Global.
 
   --- PCRs: edit, finalise, resubmit ---
   PUT   /api/pcrs/{pcr_id}
-        Updates a draft or rejected PCR (Local only, own country+TA); status must be draft or rejected; at least one optional field required.
+        Updates a PCR (Local only, own country+TA). Allowed when status is draft, regional_rejected, global_rejected, local_approved, regional_approved, or global_approved. Header X-User-Id required and must equal edited_by.
         Body: edited_by (required). Optional: pcr_id_display, product_id, product_name, current_price, proposed_price, product_skus, price_change_type, expected_response_date, price_change_reason, price_change_reason_comments, submission_context, proposed_percent, is_discontinue_price, effective_date.
 
-  PUT   /api/pcrs/{pcr_id}/regional-edit
-        Regional user edits an approved PCR (status regional_approved); cannot change proposed_price or current_price; only metadata fields.
-        Body: edited_by (required). Optional: price_change_type, expected_response_date, price_change_reason, price_change_reason_comments, submission_context, product_skus, proposed_percent, is_discontinue_price, effective_date.
-
   PUT   /api/pcrs/{pcr_id}/finalise
-        Local finalises the PCR (own country+TA); status must be regional_approved or global_approved. Inserts into sku_price_history per SKU only. Body: {"finalised_by": <user_id>}
+        Local finalises the PCR (own country+TA); status must be regional_approved or global_approved. Header X-User-Id required and must equal finalised_by. Inserts into sku_price_history per SKU only. Body: {"finalised_by": <user_id>}
 
   PUT   /api/pcrs/{pcr_id}/resubmit
-        Local user resubmits a rejected PCR; status becomes submitted and approvers are cleared so the flow can start again. Body: {"re_submitted_by": <user_id>}
+        Local user resubmits a draft or rejected PCR (status draft, regional_rejected, or global_rejected). Header X-User-Id required and must equal re_submitted_by. Status -> submitted then submit flow (local_approved). Body: {"re_submitted_by": <user_id>}
 
   --- Product / SKU history and current price ---
   GET   /api/products/by-name/{product_name}/pcrs
@@ -289,6 +290,12 @@ Plain text. Copy-paste friendly. No special characters.
   DELETE /api/admin/mdgm/{row_id}
         Delete one MDGM row by id. Response: {"message": "MDGM row deleted", "id": ...}
 
+  --- Admin: PCR actions (X-User-Id: Admin) ---
+  DELETE /api/admin/pcrs/{pcr_id}
+        Delete a PCR. Admin only. Audit: PCR admin delete.
+  PUT   /api/admin/pcrs/{pcr_id}
+        Update a PCR (status or other fields). Body: optional status, proposed_price, product_name, product_id, current_price, country, therapeutic_area, product_skus, channel, price_type, effective_date, price_change_reason, price_change_reason_comments. Audit: PCR admin update.
+
   --- Product 360 (optional X-User-Id for role-based filtering) ---
   GET   /api/product-360/therapeutic-areas   Query: country (optional), region (optional).
   GET   /api/product-360/mdgm-details       Query: brand, country; optional therapeutic_area. Returns all MDGM columns per row.
@@ -318,162 +325,284 @@ Plain text. Copy-paste friendly. No special characters.
 9b. TESTING - ALL ENDPOINTS WITH EXAMPLES (copy-paste)
 --------------------------------------------------------------------------------
   Base URL:  http://127.0.0.1:5000/api   (or 8000 if you use default uvicorn)
-  Where X-User-Id is required, use header:  X-User-Id: 1   (1 = Admin in seed; 2 = Local IN CMC, etc.)
+  Seed users: 1=Admin, 2=Local IN CMC, 3=Regional IN CMC, 4=Global (or see init_db). X-User-Id must match the acting user.
 
-  --- Health ---
+  --- CURL EXAMPLES (all logics; replace BASE and port if needed) ---
+  set BASE=http://127.0.0.1:5000/api
+
+  Health:
+    curl -s %BASE%/health
+
+  Users (no header for GET):
+    curl -s %BASE%/users
+
+  Admin - create user:
+    curl -s -X POST %BASE%/users -H "X-User-Id: 1" -H "Content-Type: application/json" -d "{\"name\":\"Test Local\",\"email\":\"local2@test.com\",\"role\":\"Local\",\"country\":\"IN\",\"therapeutic_area\":\"CMC\"}"
+  Admin - update user role:
+    curl -s -X PUT %BASE%/users/2 -H "X-User-Id: 1" -H "Content-Type: application/json" -d "{\"role\":\"Local\"}"
+  Admin - delete user:
+    curl -s -X DELETE %BASE%/users/2 -H "X-User-Id: 1"
+
+  Admin - list MDGM:
+    curl -s "%BASE%/admin/mdgm?country=IN&limit=5" -H "X-User-Id: 1"
+  Admin - create MDGM row (triggers notification to Local/Regional for that country+TA):
+    curl -s -X POST %BASE%/admin/mdgm -H "X-User-Id: 1" -H "Content-Type: application/json" -d "{\"sku_id\":\"SKU-LAUNCH-1\",\"country\":\"IN\",\"therapeutic_area\":\"CMC\",\"brand\":\"EUTHYROX\",\"channel\":\"Retail\",\"price_type\":\"NSP Minimum\"}"
+  Admin - update MDGM:
+    curl -s -X PUT %BASE%/admin/mdgm/1 -H "X-User-Id: 1" -H "Content-Type: application/json" -d "{\"current_price_eur\":100}"
+  Admin - delete MDGM (triggers notification):
+    curl -s -X DELETE %BASE%/admin/mdgm/1 -H "X-User-Id: 1"
+  Admin - delete PCR (triggers notification):
+    curl -s -X DELETE %BASE%/admin/pcrs/PCR-IN-2026-999 -H "X-User-Id: 1"
+  Admin - update PCR:
+    curl -s -X PUT %BASE%/admin/pcrs/PCR-IN-2026-002 -H "X-User-Id: 1" -H "Content-Type: application/json" -d "{\"status\":\"draft\"}"
+
+  PCR - submit (Local; X-User-Id must equal submitted_by):
+    curl -s -X POST %BASE%/pcrs -H "X-User-Id: 2" -H "Content-Type: application/json" -d "{\"submitted_by\":2,\"pcr_id\":\"PCR-IN-2026-010\",\"country\":\"IN\",\"brand\":\"EUTHYROX\",\"product_skus\":[\"SKU-001\"],\"product_name\":\"EUTHYROX 100mcg\",\"proposed_price\":\"110\",\"channel\":\"Retail\",\"price_type\":\"NSP Minimum\",\"effective_date\":\"2026-04-01\"}"
+  PCR - save as draft:
+    curl -s -X POST %BASE%/pcrs -H "X-User-Id: 2" -H "Content-Type: application/json" -d "{\"submitted_by\":2,\"pcr_id\":\"PCR-IN-2026-DRAFT\",\"country\":\"IN\",\"brand\":\"EUTHYROX\",\"product_skus\":[\"SKU-001\"],\"save_as_draft\":true}"
+  PCR - list (role-based: Local=country, Regional=region, Global=escalated_to_global+global_approved+global_rejected, Admin=all):
+    curl -s %BASE%/pcrs -H "X-User-Id: 2"
+    curl -s %BASE%/pcrs -H "X-User-Id: 4"
+  PCR - get one:
+    curl -s %BASE%/pcrs/PCR-IN-2026-010 -H "X-User-Id: 2"
+  PCR - regional approve (status must be local_approved):
+    curl -s -X PUT %BASE%/pcrs/PCR-IN-2026-010/regional-approve -H "Content-Type: application/json" -d "{\"approved_by\":3}"
+  PCR - regional reject:
+    curl -s -X PUT %BASE%/pcrs/PCR-IN-2026-010/regional-reject -H "Content-Type: application/json" -d "{\"rejected_by\":3}"
+  PCR - escalate to global (attachments required):
+    curl -s -X PUT %BASE%/pcrs/PCR-IN-2026-010/escalate-to-global -H "Content-Type: application/json" -d "{\"escalated_by\":3,\"attachments\":[\"https://example.com/doc1.pdf\"],\"comments\":\"GMAP review\"}"
+  PCR - global approve:
+    curl -s -X PUT %BASE%/pcrs/PCR-IN-2026-010/global-approve -H "Content-Type: application/json" -d "{\"approved_by\":4}"
+  PCR - global reject:
+    curl -s -X PUT %BASE%/pcrs/PCR-IN-2026-010/global-reject -H "Content-Type: application/json" -d "{\"rejected_by\":4}"
+  PCR - update (draft/rejected: any fields; regional_approved/global_approved: only proposed_price, must be >= approved price; X-User-Id = edited_by):
+    curl -s -X PUT %BASE%/pcrs/PCR-IN-2026-010 -H "X-User-Id: 2" -H "Content-Type: application/json" -d "{\"edited_by\":2,\"proposed_price\":\"115\",\"effective_date\":\"2026-05-01\"}"
+    (When already approved, sending product_name or other fields returns 400; only proposed_price allowed and must be >= regional_approved_price_eur or global_approved_price_eur.)
+  PCR - finalise (Local only; status regional_approved or global_approved; X-User-Id = finalised_by):
+    curl -s -X PUT %BASE%/pcrs/PCR-IN-2026-010/finalise -H "X-User-Id: 2" -H "Content-Type: application/json" -d "{\"finalised_by\":2}"
+    With published: -d "{\"finalised_by\":2,\"published\":true}"
+  PCR - resubmit (draft or regional_rejected or global_rejected; X-User-Id = re_submitted_by):
+    curl -s -X PUT %BASE%/pcrs/PCR-IN-2026-010/resubmit -H "X-User-Id: 2" -H "Content-Type: application/json" -d "{\"re_submitted_by\":2}"
+
+  Product / SKU / price:
+    curl -s "%BASE%/products/by-name/EUTHYROX%20100mcg/pcrs"
+    curl -s "%BASE%/skus/SKU-001/pcrs"
+    curl -s "%BASE%/countries/IN/skus/SKU-001/current-price?therapeutic_area=CMC&channel=Retail&price_type=NSP%20Minimum"
+    curl -s "%BASE%/countries/IN/skus/SKU-001/price-history?therapeutic_area=CMC&channel=Retail&price_type=NSP%20Minimum"
+    curl -s "%BASE%/countries/IN/skus/SKU-001/prices"
+
+  Product 360:
+    curl -s %BASE%/product-360/regions
+    curl -s "%BASE%/product-360/countries?region=APAC"
+    curl -s "%BASE%/product-360/therapeutic-areas?country=IN"
+    curl -s "%BASE%/product-360/brands?country=IN"
+    curl -s "%BASE%/product-360/skus?brand=EUTHYROX&country=IN"
+    curl -s "%BASE%/product-360/overview?brand=EUTHYROX"
+    curl -s "%BASE%/product-360/pricing?brand=EUTHYROX&country=IN"
+    curl -s "%BASE%/product-360/mdgm-details?brand=EUTHYROX&country=IN"
+    curl -s "%BASE%/product-360/audit-trail?brand=EUTHYROX" -H "X-User-Id: 1"
+
+  Notifications (GET includes rows with pcr_id NULL, e.g. admin/MDGM notifications, via LEFT JOIN):
+    curl -s %BASE%/users/2/notifications
+    curl -s -X PUT %BASE%/notifications/1/read
+    curl -s -X PUT %BASE%/users/2/notifications/read-all
+
+  Chats (ensure_system_groups not called per request; only at startup):
+    curl -s -X POST %BASE%/chats/direct -H "X-User-Id: 1" -H "Content-Type: application/json" -d "{\"user_id\":2}"
+    curl -s %BASE%/chats -H "X-User-Id: 1"
+    curl -s %BASE%/chats/1/messages -H "X-User-Id: 1"
+    curl -s -X POST %BASE%/chats/1/messages -H "X-User-Id: 1" -H "Content-Type: application/json" -d "{\"body\":\"Hello\"}"
+
+  Debug:
+    curl -s %BASE%/debug/sku-no-history
+
+  --- Same as above: URL + Headers + Body (for Postman / REST client) ---
+
+  Health:
   GET   http://127.0.0.1:5000/api/health
 
-  --- Users (no auth for GET) ---
+  Users:
   GET   http://127.0.0.1:5000/api/users
 
-  --- Admin: Users (X-User-Id: Admin id, e.g. 5 or 1 if seed has Admin) ---
-  POST  http://127.0.0.1:5000/api/users
-        Headers: X-User-Id: 1   Content-Type: application/json
+  Admin: Users
+  POST  http://127.0.0.1:5000/api/users   X-User-Id: 1   Content-Type: application/json
         Body: {"name": "Test User", "email": "test@example.com", "role": "Local", "country": "IN", "therapeutic_area": "CMC"}
-
-  PUT   http://127.0.0.1:5000/api/users/2
-        Headers: X-User-Id: 1   Content-Type: application/json
+  PUT   http://127.0.0.1:5000/api/users/2   X-User-Id: 1   Content-Type: application/json
         Body: {"name": "Updated Name", "role": "Local"}
+  DELETE http://127.0.0.1:5000/api/users/2   X-User-Id: 1
 
-  DELETE http://127.0.0.1:5000/api/users/2
-        Headers: X-User-Id: 1
-
-  --- Admin: MDGM ---
-  GET   http://127.0.0.1:5000/api/admin/mdgm
-        Headers: X-User-Id: 1
-  GET   http://127.0.0.1:5000/api/admin/mdgm?sku_id=SKU-001&country=IN&limit=10
-        Headers: X-User-Id: 1
-
-  POST  http://127.0.0.1:5000/api/admin/mdgm
-        Headers: X-User-Id: 1   Content-Type: application/json
+  Admin: MDGM
+  GET   http://127.0.0.1:5000/api/admin/mdgm   X-User-Id: 1
+  GET   http://127.0.0.1:5000/api/admin/mdgm?sku_id=SKU-001&country=IN&limit=10   X-User-Id: 1
+  POST  http://127.0.0.1:5000/api/admin/mdgm   X-User-Id: 1   Content-Type: application/json
         Body (minimal): {"sku_id": "SKU-NEW", "country": "IN", "therapeutic_area": "CMC", "brand": "EUTHYROX", "channel": "Retail"}
-        Body (full example): {"sku_id": "SKU-NEW", "country": "IN", "therapeutic_area": "CMC", "brand": "EUTHYROX", "channel": "Retail", "price_type": "NSP Minimum", "region": "APAC", "current_price_eur": 99.5, "currency": "EUR", "marketed_status": "Marketed"}
-
-  PUT   http://127.0.0.1:5000/api/admin/mdgm/1
-        Headers: X-User-Id: 1   Content-Type: application/json
+        Body (full): {"sku_id": "SKU-NEW", "country": "IN", "therapeutic_area": "CMC", "brand": "EUTHYROX", "channel": "Retail", "price_type": "NSP Minimum", "region": "APAC", "current_price_eur": 99.5, "currency": "EUR", "marketed_status": "Marketed"}
+  PUT   http://127.0.0.1:5000/api/admin/mdgm/1   X-User-Id: 1   Content-Type: application/json
         Body: {"current_price_eur": 105.0, "marketed_status": "Marketed"}
+  DELETE http://127.0.0.1:5000/api/admin/mdgm/1   X-User-Id: 1
 
-  DELETE http://127.0.0.1:5000/api/admin/mdgm/1
-        Headers: X-User-Id: 1
+  Admin: PCRs
+  DELETE http://127.0.0.1:5000/api/admin/pcrs/PCR-IN-2026-002   X-User-Id: 1
+  PUT   http://127.0.0.1:5000/api/admin/pcrs/PCR-IN-2026-002   X-User-Id: 1   Content-Type: application/json
+        Body: {"status": "draft"}   or  {"proposed_price": "108", "effective_date": "2026-05-01"}
 
-  --- PCRs (X-User-Id = current user) ---
-  POST  http://127.0.0.1:5000/api/pcrs
-        Headers: X-User-Id: 1   Content-Type: application/json
-        Body: {"submitted_by": 1, "pcr_id": "PCR-IN-2026-003", "country": "IN", "brand": "EUTHYROX", "product_skus": ["SKU-001"], "product_name": "EUTHYROX 100mcg", "proposed_price": "110", "channel": "Retail", "price_type": "NSP Minimum", "effective_date": "2026-04-01"}
+  PCRs (X-User-Id = acting user)
+  POST  http://127.0.0.1:5000/api/pcrs   X-User-Id: 2   Content-Type: application/json
+        Body: {"submitted_by": 2, "pcr_id": "PCR-IN-2026-003", "country": "IN", "brand": "EUTHYROX", "product_skus": ["SKU-001"], "product_name": "EUTHYROX 100mcg", "proposed_price": "110", "channel": "Retail", "price_type": "NSP Minimum", "effective_date": "2026-04-01"}
+        Draft: add "save_as_draft": true
+  GET   http://127.0.0.1:5000/api/pcrs   X-User-Id: 1  (or 2=Local, 3=Regional, 4=Global)
+  GET   http://127.0.0.1:5000/api/pcrs/PCR-IN-2026-002   X-User-Id: 1
+  PUT   http://127.0.0.1:5000/api/pcrs/PCR-IN-2026-002/regional-approve   Content-Type: application/json   Body: {"approved_by": 3}
+  PUT   http://127.0.0.1:5000/api/pcrs/PCR-IN-2026-002/regional-reject   Content-Type: application/json   Body: {"rejected_by": 3}
+  PUT   http://127.0.0.1:5000/api/pcrs/PCR-IN-2026-002/escalate-to-global   Content-Type: application/json
+        Body: {"escalated_by": 3, "attachments": ["https://...presigned-url-1", "https://...presigned-url-2"], "comments": "GMAP review"}
+  PUT   http://127.0.0.1:5000/api/pcrs/PCR-IN-2026-002/global-approve   Content-Type: application/json   Body: {"approved_by": 4}
+  PUT   http://127.0.0.1:5000/api/pcrs/PCR-IN-2026-002/global-reject   Content-Type: application/json   Body: {"rejected_by": 4}
+  PUT   http://127.0.0.1:5000/api/pcrs/PCR-IN-2026-002   X-User-Id: 2   Content-Type: application/json
+        Body: {"edited_by": 2, "proposed_price": "108", "effective_date": "2026-05-01"}
+        (When status is regional_approved or global_approved, only proposed_price is allowed and must be >= approved price.)
+  PUT   http://127.0.0.1:5000/api/pcrs/PCR-IN-2026-002/finalise   X-User-Id: 2   Content-Type: application/json
+        Body: {"finalised_by": 2}   or  {"finalised_by": 2, "published": true}
+  PUT   http://127.0.0.1:5000/api/pcrs/PCR-IN-2026-002/resubmit   X-User-Id: 2   Content-Type: application/json
+        Body: {"re_submitted_by": 2}
 
-  GET   http://127.0.0.1:5000/api/pcrs
-        Headers: X-User-Id: 1
-
-  GET   http://127.0.0.1:5000/api/pcrs/PCR-IN-2026-002
-        Headers: X-User-Id: 1
-
-  PUT   http://127.0.0.1:5000/api/pcrs/PCR-IN-2026-002/regional-approve
-        Headers: Content-Type: application/json
-        Body: {"approved_by": 3}
-
-  PUT   http://127.0.0.1:5000/api/pcrs/PCR-IN-2026-002/regional-reject
-        Body: {"rejected_by": 3}
-
-  PUT   http://127.0.0.1:5000/api/pcrs/PCR-IN-2026-002/global-approve
-        Body: {"approved_by": 4}
-  PUT   http://127.0.0.1:5000/api/pcrs/PCR-IN-2026-002/global-reject
-        Body: {"rejected_by": 4}
-
-  PUT   http://127.0.0.1:5000/api/pcrs/PCR-IN-2026-002
-        Headers: X-User-Id: 1   Content-Type: application/json
-        Body: {"edited_by": 1, "proposed_price": "108", "effective_date": "2026-05-01"}
-
-  PUT   http://127.0.0.1:5000/api/pcrs/PCR-IN-2026-002/regional-edit
-        Body: {"edited_by": 3, "effective_date": "2026-06-01"}
-
-  PUT   http://127.0.0.1:5000/api/pcrs/PCR-IN-2026-002/finalise
-        Body: {"finalised_by": 1}
-
-  PUT   http://127.0.0.1:5000/api/pcrs/PCR-IN-2026-002/resubmit
-        Body: {"re_submitted_by": 1}
-
-  --- Product / SKU / Price ---
+  Product / SKU / Price
   GET   http://127.0.0.1:5000/api/products/by-name/EUTHYROX%20100mcg/pcrs
   GET   http://127.0.0.1:5000/api/skus/SKU-001/pcrs
   GET   http://127.0.0.1:5000/api/countries/IN/skus/SKU-001/current-price?therapeutic_area=CMC&channel=Retail&price_type=NSP%20Minimum
   GET   http://127.0.0.1:5000/api/countries/IN/skus/SKU-001/price-history?therapeutic_area=CMC&channel=Retail&price_type=NSP%20Minimum
   GET   http://127.0.0.1:5000/api/countries/IN/skus/SKU-001/prices
 
-  --- Product 360 ---
+  Product 360
   GET   http://127.0.0.1:5000/api/product-360/regions
-        Optional: Headers: X-User-Id: 1
-
-  GET   http://127.0.0.1:5000/api/product-360/countries
-  GET   http://127.0.0.1:5000/api/product-360/countries?region=APAC
-
-  GET   http://127.0.0.1:5000/api/product-360/therapeutic-areas
-  GET   http://127.0.0.1:5000/api/product-360/therapeutic-areas?country=IN
-
+  GET   http://127.0.0.1:5000/api/product-360/countries   (optional ?region=APAC)
+  GET   http://127.0.0.1:5000/api/product-360/therapeutic-areas   (optional ?country=IN)
   GET   http://127.0.0.1:5000/api/product-360/brands?country=IN
-  GET   http://127.0.0.1:5000/api/product-360/brands?country=IN&therapeutic_area=CMC
-
   GET   http://127.0.0.1:5000/api/product-360/skus?brand=EUTHYROX&country=IN
-  GET   http://127.0.0.1:5000/api/product-360/skus?brand=EUTHYROX&country=IN&therapeutic_area=CMC
-
   GET   http://127.0.0.1:5000/api/product-360/overview?brand=EUTHYROX
-  GET   http://127.0.0.1:5000/api/product-360/overview?brand=EUTHYROX&country=IN
-
   GET   http://127.0.0.1:5000/api/product-360/pricing?brand=EUTHYROX&country=IN
-  GET   http://127.0.0.1:5000/api/product-360/pricing?brand=EUTHYROX&country=IN&therapeutic_area=CMC
-
   GET   http://127.0.0.1:5000/api/product-360/mdgm-details?brand=EUTHYROX&country=IN
-  GET   http://127.0.0.1:5000/api/product-360/mdgm-details?brand=EUTHYROX&country=IN&therapeutic_area=CMC
+  GET   http://127.0.0.1:5000/api/product-360/audit-trail   X-User-Id: 1   (optional ?brand=&country=&sku_id=)
 
-  GET   http://127.0.0.1:5000/api/product-360/audit-trail
-        Headers: X-User-Id: 1   (Admin only)
-  GET   http://127.0.0.1:5000/api/product-360/audit-trail?brand=EUTHYROX&country=IN&sku_id=SKU-001
-        Headers: X-User-Id: 1
-
-  --- Notifications ---
+  Notifications (includes admin/MDGM notifications where pcr_id is null)
   GET   http://127.0.0.1:5000/api/users/1/notifications
   PUT   http://127.0.0.1:5000/api/notifications/1/read
   PUT   http://127.0.0.1:5000/api/users/1/notifications/read-all
 
-  --- Chats ---
-  POST  http://127.0.0.1:5000/api/chats/direct
-        Headers: X-User-Id: 1   Content-Type: application/json
-        Body: {"user_id": 2}
+  Chats
+  POST  http://127.0.0.1:5000/api/chats/direct   X-User-Id: 1   Content-Type: application/json   Body: {"user_id": 2}
+  GET   http://127.0.0.1:5000/api/chats   X-User-Id: 1
+  GET   http://127.0.0.1:5000/api/chats/1/messages   X-User-Id: 1
+  POST  http://127.0.0.1:5000/api/chats/1/messages   X-User-Id: 1   Content-Type: application/json   Body: {"body": "Hello"}
 
-  GET   http://127.0.0.1:5000/api/chats
-        Headers: X-User-Id: 1
-
-  GET   http://127.0.0.1:5000/api/chats/1/messages
-        Headers: X-User-Id: 1
-
-  POST  http://127.0.0.1:5000/api/chats/1/messages
-        Headers: X-User-Id: 1   Content-Type: application/json
-        Body: {"body": "Hello"}
-
-  --- Debug ---
+  Debug
   GET   http://127.0.0.1:5000/api/debug/sku-no-history
 
 
 --------------------------------------------------------------------------------
-10. REQUEST BODY EXAMPLES (JSON)
+10. REQUEST BODY EXAMPLES (JSON) - copy-paste into Postman/body
 --------------------------------------------------------------------------------
 
-  Submit PCR:
-    {"submitted_by": 1, "pcr_id": "PCR-001", "country": "IN", "brand": "EUTHYROX", "product_skus": ["SKU-1"], "product_name": "Product A", "current_price": "100", "proposed_price": "120"}
+  --- POST /api/users (Admin create user) ---
+  Minimal:
+  {"name": "Test User", "email": "test@example.com", "role": "Local"}
+  Full:
+  {"name": "Ravi Kumar", "email": "ravi@example.com", "role": "Local", "country": "IN", "therapeutic_area": "CMC"}
+  Regional:
+  {"name": "Regional User", "email": "regional@example.com", "role": "Regional", "country": "IN", "therapeutic_area": "CMC", "region": "APAC"}
+  Global:
+  {"name": "Global User", "email": "global@example.com", "role": "Global"}
+  Admin:
+  {"name": "Admin Two", "email": "admin2@example.com", "role": "Admin"}
 
-  Approve / Reject:
-    {"approved_by": 2}   or   {"rejected_by": 2}
+  --- PUT /api/users/{user_id} (Admin update user) ---
+  Change role:
+  {"role": "Regional"}
+  Change name and country:
+  {"name": "Updated Name", "country": "JP", "therapeutic_area": "CMC"}
+  At least one field required.
 
-  Update PCR (rejected):
-    {"edited_by": 1, "product_name": "Updated name", "proposed_price": "105"}
+  --- POST /api/admin/mdgm (Admin create SKU row) ---
+  Minimal (required only):
+  {"sku_id": "SKU-NEW-001", "country": "IN", "therapeutic_area": "CMC", "brand": "EUTHYROX", "channel": "Retail"}
+  With price and price_type:
+  {"sku_id": "SKU-NEW-001", "country": "IN", "therapeutic_area": "CMC", "brand": "EUTHYROX", "channel": "Retail", "price_type": "NSP Minimum", "current_price_eur": 99.5}
+  Full (all optional fields):
+  {"sku_id": "SKU-NEW-001", "country": "IN", "therapeutic_area": "CMC", "brand": "EUTHYROX", "channel": "Retail", "price_type": "NSP Minimum", "region": "APAC", "global_product_name": "EUTHYROX 100mcg", "local_product_name": "EUTHYROX 100mcg IN", "currency": "EUR", "marketed_status": "Marketed", "current_price_eur": 99.5}
 
-  Regional edit:
-    {"edited_by": 3, "price_change_reason": "Market update", "effective_date": "2025-03-01"}
+  --- PUT /api/admin/mdgm/{row_id} (Admin update MDGM row) ---
+  Update price only:
+  {"current_price_eur": 105.0}
+  Update several:
+  {"current_price_eur": 105.0, "marketed_status": "Marketed", "local_product_name": "Updated name"}
+  At least one field required.
 
-  Finalise:   {"finalised_by": 1}
-  (Example: 1 = Local user; only Local can finalise.)
-  Resubmit:   {"re_submitted_by": 1}
-  Direct chat:   {"user_id": 2}
-  Send message:   {"body": "Hello"}
+  --- PUT /api/admin/pcrs/{pcr_id} (Admin update PCR) ---
+  Set to draft:
+  {"status": "draft"}
+  Change price and date:
+  {"proposed_price": "108", "effective_date": "2026-05-01"}
+  Change product info:
+  {"product_name": "New Product Name", "product_skus": "SKU-001,SKU-002", "country": "IN", "therapeutic_area": "CMC"}
+  At least one field required.
+
+  --- POST /api/pcrs (Local submit PCR) ---
+  Minimal submit:
+  {"submitted_by": 2, "pcr_id": "PCR-IN-2026-001", "country": "IN", "brand": "EUTHYROX", "product_skus": ["SKU-001"]}
+  Full submit (typical):
+  {"submitted_by": 2, "pcr_id": "PCR-IN-2026-001", "country": "IN", "brand": "EUTHYROX", "product_skus": ["SKU-001"], "product_name": "EUTHYROX 100mcg", "product_id": "PROD-001", "proposed_price": "110", "channel": "Retail", "price_type": "NSP Minimum", "price_change_type": "Price Increase", "effective_date": "2026-04-01", "price_change_reason": "Market adjustment", "price_change_reason_comments": "Approved by country lead", "submission_context": "Q2 launch"}
+  With submission attachments (presigned URLs):
+  {"submitted_by": 2, "pcr_id": "PCR-IN-2026-002", "country": "IN", "brand": "EUTHYROX", "product_skus": ["SKU-001"], "product_name": "EUTHYROX 100mcg", "proposed_price": "110", "channel": "Retail", "price_type": "NSP Minimum", "effective_date": "2026-04-01", "attachments": ["https://minio.example.com/bucket/doc1.pdf?X-Amz-..."]}
+  Save as draft (no submit flow):
+  {"submitted_by": 2, "pcr_id": "PCR-IN-2026-DRAFT", "country": "IN", "brand": "EUTHYROX", "product_skus": ["SKU-001"], "save_as_draft": true}
+  Price decrease:
+  {"submitted_by": 2, "pcr_id": "PCR-IN-2026-003", "country": "IN", "brand": "EUTHYROX", "product_skus": ["SKU-001"], "proposed_price": "95", "channel": "Retail", "price_type": "NSP Minimum", "price_change_type": "Price Decrease", "effective_date": "2026-04-01"}
+
+  --- PUT /api/pcrs/{pcr_id}/regional-approve ---
+  {"approved_by": 3}
+
+  --- PUT /api/pcrs/{pcr_id}/regional-reject ---
+  {"rejected_by": 3}
+
+  --- PUT /api/pcrs/{pcr_id}/escalate-to-global (attachments required) ---
+  Minimal:
+  {"escalated_by": 3, "attachments": ["https://example.com/presigned-doc1.pdf"]}
+  With comments:
+  {"escalated_by": 3, "attachments": ["https://example.com/doc1.pdf", "https://example.com/doc2.pdf"], "comments": "GMAP review requested for exception"}
+
+  --- PUT /api/pcrs/{pcr_id}/global-approve ---
+  {"approved_by": 4}
+
+  --- PUT /api/pcrs/{pcr_id}/global-reject ---
+  {"rejected_by": 4}
+
+  --- PUT /api/pcrs/{pcr_id} (Local update; when approved only proposed_price allowed, >= approved price) ---
+  Draft/rejected - full edit:
+  {"edited_by": 2, "product_name": "Updated name", "proposed_price": "108", "effective_date": "2026-05-01", "price_change_reason": "Updated reason", "product_skus": "SKU-001,SKU-002"}
+  Draft - change price only:
+  {"edited_by": 2, "proposed_price": "105"}
+  When status is regional_approved or global_approved - only proposed_price (must be >= approved price):
+  {"edited_by": 2, "proposed_price": "115"}
+  X-User-Id header must equal edited_by. At least one field besides edited_by required.
+
+  --- PUT /api/pcrs/{pcr_id}/finalise (Local only) ---
+  Minimal:
+  {"finalised_by": 2}
+  With published flag:
+  {"finalised_by": 2, "published": true}
+  X-User-Id header must equal finalised_by.
+
+  --- PUT /api/pcrs/{pcr_id}/resubmit (draft or regional_rejected or global_rejected) ---
+  {"re_submitted_by": 2}
+  X-User-Id header must equal re_submitted_by.
+
+  --- POST /api/chats/direct ---
+  {"user_id": 2}
+  (Creates or returns existing direct chat with user 2. X-User-Id = your user id.)
+
+  --- POST /api/chats/{chat_id}/messages ---
+  {"body": "Hello, please review PCR-IN-2026-001"}
+  X-User-Id = sender.
 
 
 --------------------------------------------------------------------------------
@@ -496,6 +625,41 @@ Plain text. Copy-paste friendly. No special characters.
 13. NOT IMPLEMENTED
 --------------------------------------------------------------------------------
 
-  Escalation criteria (table exists; no API or rules). Audit log. Group chat create API (model exists; no POST route).
+  Escalation criteria (table exists; no API or rules). Group chat create API (model exists; no POST route). Audit log is implemented (log_audit, audit_log table, Product 360 audit-trail).
+
+
+--------------------------------------------------------------------------------
+14. LOGIC AUDIT (Gaps addressed)
+--------------------------------------------------------------------------------
+
+  Reviewed all PCR, role, and API logic. Gaps that were fixed or documented:
+
+  1. Reject statuses
+     - Regional reject and Global reject were setting status = 'draft'. Editable/resubmit logic allowed 'regional_rejected' and 'global_rejected' but those were never set.
+     - Fixed: Regional reject now sets status = 'regional_rejected'; Global reject sets status = 'global_rejected'. Resubmit and update still allow draft, regional_rejected, global_rejected so UI can show rejection source and Local can edit/resubmit.
+
+  2. X-User-Id enforcement
+     - Submit already required X-User-Id and enforced submitted_by == x_user_id. Update, finalise, and resubmit did not require or validate X-User-Id vs edited_by/finalised_by/re_submitted_by.
+     - Fixed: PUT /pcrs/{id}, PUT finalise, PUT resubmit now require header X-User-Id and return 403 if it does not match the body actor id (edited_by, finalised_by, re_submitted_by).
+
+  3. Global approver in API response
+     - GET /pcrs and GET /pcrs/{pcr_id} did not include global_approver_name (no JOIN to global_approved_by user).
+     - Fixed: Both endpoints now JOIN users ga ON p.global_approved_by = ga.id and return global_approver_name.
+
+  4. Escalation attachments format
+     - escalation_attachments stored as comma-separated string; API returned it raw. Frontend expects presigned URLs as a list.
+     - Fixed: GET list and GET single now return escalation_attachments as an array of strings (split on comma); empty array if none.
+
+  5. Escalate-to-Global mandatory attachments
+     - Already enforced: attachments (presigned URLs) required, non-empty; documented in models and BACKEND_DOCUMENTATION.
+
+  6. Local edit after Global approval
+     - Already allowed: editable_statuses include global_approved so Local can edit before finalising.
+
+  7. Global visibility
+     - Global can act only on PCRs with status escalated_to_global (see _user_can_approve_for_pcr and global_approve). For visibility: GET /pcrs shows status in {escalated_to_global, global_approved} for Global; GET /pcrs/{id} allows Global when status in {escalated_to_global, global_approved}, returning 403 otherwise. This lets Global view PCRs they have already approved while still acting only on escalated items.
+
+  8. Resubmit flow
+     - Resubmit already calls run_submit_approval_flow after UPDATE, so status goes submitted -> local_approved and notifications fire; no bug.
 
 ================================================================================

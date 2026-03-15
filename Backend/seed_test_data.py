@@ -27,18 +27,24 @@ async def seed():
                 (code, name, region),
             )
 
-        # 3) Users: Local, Regional, Global, Admin
-        for name, email, role, country, ta, region in [
-            ("Vishal", "vishal@gmail.com", "Local", "IN", "CMC", "APAC"),
-            ("Rajesh", "rajesh@gmail.com", "Local", "IN", "CMC", "APAC"),
-            ("Rati", "rati@gmail.com", "Regional", "IN", "CMC", "APAC"),
-            ("Ramya", "ramya@gmail.com", "Regional", "JP", "Oncology", "APAC"),
-            ("Michael", "micheal@gmail.com", "Global", None, None, None),
-            ("Sarah", "sarah@gmail.com", "Admin", None, None, None),
+        # 3) Users: Local, Regional, Global, Admin (country lives in user_countries for Local)
+        for name, email, role, ta, region in [
+            ("Vishal", "vishal@gmail.com", "Local", "CMC", "APAC"),
+            ("Rajesh", "rajesh@gmail.com", "Local", "CMC", "APAC"),
+            ("Rati", "rati@gmail.com", "Regional", "CMC", "APAC"),
+            ("Ramya", "ramya@gmail.com", "Regional", "Oncology", "APAC"),
+            ("Michael", "micheal@gmail.com", "Global", None, None),
+            ("Sarah", "sarah@gmail.com", "Admin", None, None),
         ]:
             await conn.execute(
-                "INSERT OR IGNORE INTO users (name, email, role, country, therapeutic_area, region) VALUES (?, ?, ?, ?, ?, ?)",
-                (name, email, role, country, ta, region),
+                "INSERT OR IGNORE INTO users (name, email, role, therapeutic_area, region) VALUES (?, ?, ?, ?, ?)",
+                (name, email, role, ta, region),
+            )
+        # Local users: assign countries via user_countries
+        for email, country in [("vishal@gmail.com", "IN"), ("rajesh@gmail.com", "IN")]:
+            await conn.execute(
+                "INSERT OR IGNORE INTO user_countries (user_id, country) SELECT id, ? FROM users WHERE email = ?",
+                (country, email),
             )
 
         # 4) MDGM: ~100 rows with region, marketed_status, currency

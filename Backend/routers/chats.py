@@ -19,7 +19,6 @@ async def create_direct_chat(request: DirectChatCreate, x_user_id: int = Header(
 
 @router.get("/chats")
 async def list_my_chats(x_user_id: int = Header(..., alias="X-User-Id")):
-    await database.ensure_system_groups()
     conn = await database.get_connection()
     try:
         conn.row_factory = lambda c, r: dict(zip([col[0] for col in c.description], r))
