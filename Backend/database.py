@@ -228,17 +228,8 @@ async def init_db():
                 FOREIGN KEY (user_id) REFERENCES users(id)
             );
         """)
-        await conn.execute("""
-            CREATE TABLE IF NOT EXISTS pcr_escalation (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                pcr_id TEXT NOT NULL,
-                channel TEXT NOT NULL,
-                proposed_list_price TEXT,
-                list_floor TEXT,
-                escalation TEXT,
-                FOREIGN KEY (pcr_id) REFERENCES pcrs(pcr_id_display) ON DELETE CASCADE
-            );
-        """)
+        # pcr_escalation table removed; escalation is tracked on pcrs (escalated_by, escalation_attachments, etc.)
+        await conn.execute("DROP TABLE IF EXISTS pcr_escalation")
         await conn.execute("""
         CREATE TABLE IF NOT EXISTS chats (
             id INTEGER PRIMARY KEY AUTOINCREMENT,

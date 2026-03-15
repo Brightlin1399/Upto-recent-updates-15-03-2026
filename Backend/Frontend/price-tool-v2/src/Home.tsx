@@ -2005,7 +2005,6 @@ function DetailPage({ row, onBack, loggedInUser, onSummit, onSave, onLocalApprov
                 loggedInUser?.role === "GLOBAL USER") && (
               <>
               
-              <Tab to="EscalationPage" label="ESCALATION CRITERIA" />
               <Tab to="RecommendationPage" label="RECOMMENDATION" />
               </>
               )}
