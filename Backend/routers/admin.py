@@ -77,9 +77,9 @@ async def create_mdgm(
             """INSERT INTO sku_mdgm_master
                (country, region, therapeutic_area, brand, global_product_name, local_product_name, sku_id, pu, measure,
                 dimension, volume_of_container, container, strength, currency, erp_applicable, pack_size,
-                reimbursement_price_local, reimbursement_price_eur, reimbursement_status, reimbursement_rate,
+                reimbursement_price_local, reimbursement_price_eur, reimbursement_status, reimbursement_type, reimbursement_rate, vat_rate,
                 marketed_status, channel, price_type, current_price_eur)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
             (
                 request.country.strip(),
                 request.region.strip() if request.region else None,
@@ -100,7 +100,9 @@ async def create_mdgm(
                 request.reimbursement_price_local,
                 request.reimbursement_price_eur,
                 request.reimbursement_status.strip() if request.reimbursement_status else None,
+                request.reimbursement_type.strip() if request.reimbursement_type else None,
                 request.reimbursement_rate,
+                request.vat_rate,
                 request.marketed_status.strip() if request.marketed_status else None,
                 request.channel.strip() or "Retail",
                 request.price_type.strip() if request.price_type else None,
@@ -261,9 +263,15 @@ async def update_mdgm(
     if request.reimbursement_status is not None:
         updates.append("reimbursement_status = ?")
         params.append(request.reimbursement_status.strip())
+    if request.reimbursement_type is not None:
+        updates.append("reimbursement_type = ?")
+        params.append(request.reimbursement_type.strip())
     if request.reimbursement_rate is not None:
         updates.append("reimbursement_rate = ?")
         params.append(request.reimbursement_rate)
+    if request.vat_rate is not None:
+        updates.append("vat_rate = ?")
+        params.append(request.vat_rate)
     if request.marketed_status is not None:
         updates.append("marketed_status = ?")
         params.append(request.marketed_status.strip())

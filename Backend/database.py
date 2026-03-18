@@ -9,7 +9,7 @@ DB_path = os.path.join(os.path.dirname(__file__), "price_tool.db")
 MDGM_COLS = (
     "id, country, region, therapeutic_area, brand, global_product_name, local_product_name, sku_id,"
     " pu, measure, dimension, volume_of_container, container, strength, currency, erp_applicable, pack_size,"
-    " reimbursement_price_local, reimbursement_price_eur, reimbursement_status, reimbursement_rate,"
+    " reimbursement_price_local, reimbursement_price_eur, reimbursement_status, reimbursement_type, reimbursement_rate, vat_rate,"
     " marketed_status, channel, price_type, last_pricing_update, current_price_eur"
 )
 
@@ -17,6 +17,55 @@ MDGM_COLS = (
 async def get_connection():
     """Return an aiosqlite connection. Caller must await conn.close() when done."""
     return await aiosqlite.connect(DB_path)
+
+
+def _split_csv(value: str | None, *, upper: bool = False) -> list[str]:
+    """Split comma-separated values into a normalized, de-duplicated list."""
+    if not value or not isinstance(value, str):
+        return []
+    parts = [p.strip() for p in value.split(",")]
+    parts = [p for p in parts if p]
+    if upper:
+        parts = [p.upper() for p in parts]
+    out: list[str] = []
+    seen: set[str] = set()
+    for p in parts:
+        if p not in seen:
+            out.append(p)
+            seen.add(p)
+    return out
+
+
+async def sync_user_mappings_from_users(conn: aiosqlite.Connection) -> None:
+    """Sync user_countries and user_therapeutic_areas from users.{countries, therapeutic_areas}.
+
+    Intended usage: call after tables exist. Safe to run on each startup.
+    """
+    conn.row_factory = lambda c, r: dict(zip([col[0] for col in c.description], r))
+    async with conn.execute(
+        "SELECT id, countries, therapeutic_areas FROM users"
+    ) as cur:
+        users = await cur.fetchall()
+
+    for u in users:
+        uid = u["id"]
+        countries = _split_csv(u.get("countries"), upper=True)
+        tas = _split_csv(u.get("therapeutic_areas"), upper=False)
+
+        # Replace per-user mappings to avoid drift if CSV changes
+        await conn.execute("DELETE FROM user_countries WHERE user_id = ?", (uid,))
+        await conn.execute("DELETE FROM user_therapeutic_areas WHERE user_id = ?", (uid,))
+
+        for c in countries:
+            await conn.execute(
+                "INSERT OR IGNORE INTO user_countries (user_id, country) VALUES (?, ?)",
+                (uid, c),
+            )
+        for ta in tas:
+            await conn.execute(
+                "INSERT OR IGNORE INTO user_therapeutic_areas (user_id, therapeutic_area) VALUES (?, ?)",
+                (uid, ta),
+            )
 
 
 async def log_audit(
@@ -105,14 +154,11 @@ async def init_db():
         name TEXT NOT NULL,
         email TEXT UNIQUE NOT NULL,
         role TEXT NOT NULL CHECK(role IN('Local', 'Regional', 'Global', 'Admin')),
-        therapeutic_area TEXT,
-        region TEXT
+        region TEXT,
+        countries TEXT,
+        therapeutic_areas TEXT
         );
         """)
-        async with conn.execute("PRAGMA table_info(users)") as cur:
-            user_cols = [row[1] for row in await cur.fetchall()]
-        if "region" not in user_cols:
-            await conn.execute("ALTER TABLE users ADD COLUMN region TEXT")
         await conn.execute("""
             CREATE TABLE IF NOT EXISTS pcrs (
                 pcr_id_display TEXT PRIMARY KEY,
@@ -142,7 +188,6 @@ async def init_db():
                 published INTEGER DEFAULT 0,
                 channel TEXT NOT NULL DEFAULT 'Retail',
                 price_type TEXT,
-                floor_price TEXT,
                 escalated_by INTEGER,
                 escalated_at TEXT,
                 global_approved_by INTEGER,
@@ -155,45 +200,7 @@ async def init_db():
                 FOREIGN KEY (global_approved_by) REFERENCES users(id)
             );
         """)
-        # Ensure new approval reference price and attachment columns exist on existing databases
-        async with conn.execute("PRAGMA table_info(pcrs)") as cur:
-            pcr_cols = [row[1] for row in await cur.fetchall()]
-        if "regional_approved_price_eur" not in pcr_cols:
-            await conn.execute("ALTER TABLE pcrs ADD COLUMN regional_approved_price_eur REAL")
-        if "global_approved_price_eur" not in pcr_cols:
-            await conn.execute("ALTER TABLE pcrs ADD COLUMN global_approved_price_eur REAL")
-        # Submission attachments (Local -> Regional): optional, stored as comma-separated presigned URLs.
-        if "submission_attachments" not in pcr_cols:
-            await conn.execute("ALTER TABLE pcrs ADD COLUMN submission_attachments TEXT")
-        # Escalation metadata (Regional -> Global). Stored as comma-separated attachment references and optional comments.
-        if "escalation_attachments" not in pcr_cols:
-            await conn.execute("ALTER TABLE pcrs ADD COLUMN escalation_attachments TEXT")
-        if "escalation_comments" not in pcr_cols:
-            await conn.execute("ALTER TABLE pcrs ADD COLUMN escalation_comments TEXT")
 
-        await conn.execute("""
-            CREATE TABLE IF NOT EXISTS sku_channel_prices (
-                sku_id TEXT NOT NULL,
-                country TEXT NOT NULL,
-                therapeutic_area TEXT NOT NULL,
-                channel TEXT NOT NULL,
-                price_type TEXT NOT NULL,
-                floor_price_eur REAL,
-                current_price_eur REAL,
-                effective_from TEXT,
-                pcr_id TEXT,
-                updated_at DATETIME DEFAULT CURRENT_TIMESTAMP,
-                PRIMARY KEY (sku_id, country, therapeutic_area, channel, price_type)
-            );
-        """)
-        async with conn.execute("PRAGMA table_info(sku_channel_prices)") as cur:
-            scp_cols = [row[1] for row in await cur.fetchall()]
-        if "current_price_eur" not in scp_cols:
-            await conn.execute("ALTER TABLE sku_channel_prices ADD COLUMN current_price_eur REAL")
-        if "effective_from" not in scp_cols:
-            await conn.execute("ALTER TABLE sku_channel_prices ADD COLUMN effective_from TEXT")
-        if "pcr_id" not in scp_cols:
-            await conn.execute("ALTER TABLE sku_channel_prices ADD COLUMN pcr_id TEXT")
         await conn.execute("""
             CREATE TABLE IF NOT EXISTS sku_price_history (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -203,17 +210,12 @@ async def init_db():
                 channel TEXT NOT NULL,
                 price_type TEXT,
                 price_eur REAL NOT NULL,
-                floor_price_eur REAL,
                 effective_from DATE NOT NULL,
                 pcr_id TEXT,
                 created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
                 FOREIGN KEY (pcr_id) REFERENCES pcrs(pcr_id_display)
             );
         """)
-        async with conn.execute("PRAGMA table_info(sku_price_history)") as cur:
-            cols = [row[1] for row in await cur.fetchall()]
-        if "floor_price_eur" not in cols:
-            await conn.execute("ALTER TABLE sku_price_history ADD COLUMN floor_price_eur REAL")
 
         await conn.execute("""
             CREATE TABLE IF NOT EXISTS notifications(
@@ -274,10 +276,6 @@ async def init_db():
             FOREIGN KEY (user_id) REFERENCES users(id)
         );
         """)
-        async with conn.execute("PRAGMA table_info(audit_log)") as cur:
-            audit_cols = [row[1] for row in await cur.fetchall()]
-        if "sku_id" not in audit_cols:
-            await conn.execute("ALTER TABLE audit_log ADD COLUMN sku_id TEXT")
 
         await conn.execute("""
         CREATE TABLE IF NOT EXISTS sku_mdgm_master (
@@ -301,24 +299,52 @@ async def init_db():
             reimbursement_price_local REAL,
             reimbursement_price_eur REAL,
             reimbursement_status TEXT,
+            reimbursement_type TEXT,
             reimbursement_rate REAL,
+            vat_rate REAL,
             marketed_status TEXT,
             channel TEXT NOT NULL DEFAULT 'Retail',
             price_type TEXT,
-            floor_price_eur REAL,
             last_pricing_update DATETIME DEFAULT CURRENT_TIMESTAMP,
+            current_price_eur REAL,
             UNIQUE(sku_id, country, channel, price_type)
         );
         """)
-        # Ensure floor_price_eur, price_type, and current_price_eur exist on existing databases
-        async with conn.execute("PRAGMA table_info(sku_mdgm_master)") as cur:
-            mdgm_cols = [row[1] for row in await cur.fetchall()]
-        if "floor_price_eur" not in mdgm_cols:
-            await conn.execute("ALTER TABLE sku_mdgm_master ADD COLUMN floor_price_eur REAL")
-        if "price_type" not in mdgm_cols:
-            await conn.execute("ALTER TABLE sku_mdgm_master ADD COLUMN price_type TEXT")
-        if "current_price_eur" not in mdgm_cols:
-            await conn.execute("ALTER TABLE sku_mdgm_master ADD COLUMN current_price_eur REAL")
+        await conn.execute("""
+        CREATE TABLE IF NOT EXISTS sku_mdgm_overrides (
+            sku_id TEXT NOT NULL,
+            country TEXT NOT NULL,
+            therapeutic_area TEXT NOT NULL,
+            channel TEXT NOT NULL DEFAULT 'Retail',
+            price_type TEXT,
+
+            -- editable launched/current price
+            current_price_eur REAL,
+            effective_from DATE,
+            expiration_date DATE,
+
+            -- editable business fields
+            marketed_status TEXT,
+            reimbursement_price_local REAL,
+            reimbursement_price_eur REAL,
+            reimbursement_status TEXT,
+            reimbursement_type TEXT,
+            reimbursement_rate REAL,
+            vat_rate REAL,
+
+            -- audit (optional)
+            source TEXT,
+            source_ref TEXT,
+            updated_by INTEGER,
+            updated_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+
+            PRIMARY KEY (sku_id, country, therapeutic_area, channel, price_type)
+        );
+        """)
+        await conn.execute("""
+            CREATE INDEX IF NOT EXISTS idx_sku_mdgm_overrides_lookup
+            ON sku_mdgm_overrides (country, therapeutic_area, channel, price_type, sku_id)
+        """)
         async with conn.execute("SELECT COUNT(*) FROM regions") as cur:
             if (await cur.fetchone())[0] == 0:
                 await conn.execute(
@@ -340,23 +366,16 @@ async def init_db():
                 FOREIGN KEY (country) REFERENCES countries(code)
             );
             """)
-        async with conn.execute("SELECT COUNT(*) FROM users") as cur:
-            count = (await cur.fetchone())[0]
-        if count == 0:
-            await conn.executescript("""
-                INSERT INTO users (name, email, role, therapeutic_area, region) VALUES
-                    ('Vishal', 'vishal@gmail.com', 'Local', 'CMC', 'APAC'),
-                    ('Rajesh', 'rajesh@gmail.com', 'Local', 'CMC', 'APAC'),
-                    ('Rati', 'rati@gmail.com', 'Regional', 'CMC', 'APAC'),
-                    ('Ramya', 'ramya@gmail.com', 'Regional', 'Oncology', 'APAC'),
-                    ('Michael', 'micheal@gmail.com', 'Global', NULL, NULL),
-                    ('Sarah', 'sarah@gmail.com', 'Admin', NULL, NULL);
-                INSERT INTO user_countries (user_id, country)
-                SELECT id, 'IN' FROM users WHERE email IN ('vishal@gmail.com', 'rajesh@gmail.com');
-                INSERT INTO user_countries (user_id, country)
-                SELECT id, 'JP' FROM users WHERE email = 'vishal@gmail.com';
+        await conn.execute("""
+            CREATE TABLE IF NOT EXISTS user_therapeutic_areas (
+                user_id INTEGER NOT NULL,
+                therapeutic_area TEXT NOT NULL,
+                PRIMARY KEY (user_id, therapeutic_area),
+                FOREIGN KEY (user_id) REFERENCES users(id)
+            );
             """)
-            print("Added 6 users (Local, Regional, Global, Admin) and user_countries for Local (Vishal: IN, JP; Rajesh: IN)")
+        # Populate mapping tables from users CSV columns (countries, therapeutic_areas)
+        await sync_user_mappings_from_users(conn)
         await conn.commit()
     finally:
         await conn.close()

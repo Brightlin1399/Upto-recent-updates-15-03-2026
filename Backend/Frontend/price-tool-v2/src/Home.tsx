@@ -1,7 +1,7 @@
 import React, { useState, useEffect } from 'react';
 import { Link, Outlet } from 'react-router-dom';
 import { NavLink } from "react-router-dom";
-import { fetchRegions, fetchCountries, fetchBrands, fetchSkus } from './api/product360';
+import { fetchRegions, fetchCountries, fetchBrands, fetchSkus, fetchEligibleSkus } from './api/product360';
 
 type HomeProps = {
   loggedInUser: {
@@ -34,7 +34,8 @@ export default function Home({ loggedInUser }:HomeProps) {
   const [newEntry, setNewEntry] = useState({
     countries: [] as string[],
     brand: '',
-    sku: [] as string[]
+    sku: [] as string[],
+    priceChangeType: 'Voluntary Price Change' as string,
   });
   // Current + floor price per SKU when creating PCR (from backend)
   const [createModalSkuPrices, setCreateModalSkuPrices] = useState<Record<string, { current_price_eur: number | null; floor_price_eur: number | null }>>({});
@@ -71,7 +72,8 @@ const [createModalCountries, setCreateModalCountries] = useState<Array<{ code: s
 const [createModalCountriesLoading, setCreateModalCountriesLoading] = useState(false);
 const [createModalBrands, setCreateModalBrands] = useState<Array<{ brand: string; therapeutic_area: string }>>([]);
 const [createModalBrandsLoading, setCreateModalBrandsLoading] = useState(false);
-const [createModalSkus, setCreateModalSkus] = useState<string[]>([]);
+  const [createModalSkus, setCreateModalSkus] = useState<string[]>([]);
+  const [eligibleSkus, setEligibleSkus] = useState<{ withPrice: string[]; withoutPrice: string[] }>({ withPrice: [], withoutPrice: [] });
 const [createModalSkusLoading, setCreateModalSkusLoading] = useState(false);
 
 const [currentPage, setCurrentPage] = useState(1);
@@ -181,19 +183,37 @@ useEffect(() => {
     .finally(() => setCreateModalBrandsLoading(false));
 }, [loggedInUser?.id, newEntry.countries.join(',')]);
 
-// Load SKUs when user selects brand and country in Create New PCR
+// Load eligible SKUs when user selects brand, country, and price change type in Create New PCR
 useEffect(() => {
   if (!loggedInUser?.id || !newEntry.brand || newEntry.countries.length === 0) {
     setCreateModalSkus([]);
+    setEligibleSkus({ withPrice: [], withoutPrice: [] });
     return;
   }
   const ta = createModalBrands.find((b) => b.brand === newEntry.brand)?.therapeutic_area;
+  if (!ta) {
+    setCreateModalSkus([]);
+    setEligibleSkus({ withPrice: [], withoutPrice: [] });
+    return;
+  }
   setCreateModalSkusLoading(true);
-  fetchSkus(newEntry.brand, newEntry.countries[0], ta, loggedInUser.id)
-    .then((data) => setCreateModalSkus(data.skus || []))
-    .catch(() => setCreateModalSkus([]))
+  const country = newEntry.countries[0];
+  const channel = 'Retail';
+  const priceType = 'NSP Minimum';
+  fetchEligibleSkus(newEntry.brand, country, ta, channel, priceType, newEntry.priceChangeType, loggedInUser.id)
+    .then((data) => {
+      const withPrice = data.skus_with_price || [];
+      const withoutPrice = data.skus_without_price || [];
+      setEligibleSkus({ withPrice, withoutPrice });
+      const isLaunch = newEntry.priceChangeType === 'New Product Launch';
+      setCreateModalSkus(isLaunch ? withoutPrice : withPrice);
+    })
+    .catch(() => {
+      setCreateModalSkus([]);
+      setEligibleSkus({ withPrice: [], withoutPrice: [] });
+    })
     .finally(() => setCreateModalSkusLoading(false));
-}, [loggedInUser?.id, newEntry.brand, newEntry.countries[0], createModalBrands]);
+}, [loggedInUser?.id, newEntry.brand, newEntry.countries[0], newEntry.priceChangeType, createModalBrands]);
 
 // Filter data based on logged-in user and draft status
 useEffect(() => {
@@ -267,11 +287,20 @@ const goToPage = (pageNumber) => {
 
 
 function handleBrandChange(e) {
-  setNewEntry({
-    ...newEntry,
+  setNewEntry(prev => ({
+    ...prev,
     brand: e.target.value,
     sku: []
-  });
+  }));
+}
+
+function handlePriceChangeTypeChange(e) {
+  const value = e.target.value;
+  setNewEntry(prev => ({
+    ...prev,
+    priceChangeType: value,
+    sku: [],
+  }));
 }
 
 
@@ -351,7 +380,7 @@ function handleSkuChange(skuValue) {
     productFamily: newEntry.brand,
     sku: newEntry.sku.join(', '),
     name: loggedInUser?.email || 'Current User',
-    priceChangeType: 'Voluntary Price Change',
+    priceChangeType: newEntry.priceChangeType || 'Voluntary Price Change',
     priceChangeReason: 'Other',
     approvalStatus: 'Draft',
     submittedDate: getCurrentDate(),
@@ -1112,7 +1141,28 @@ function handleSkuChange(skuValue) {
                 </select>
               </div>
               
-              {/* SKUs from backend (product-360/skus) */}
+              {/* Price Change Type for this PCR */}
+              <div>
+                <label className="block mb-2 font-medium text-gray-700">Price Change Type</label>
+                <select
+                  value={newEntry.priceChangeType}
+                  onChange={handlePriceChangeTypeChange}
+                  disabled={!newEntry.brand}
+                  className={`w-full p-2 border rounded ${
+                    !newEntry.brand ? "bg-gray-100 cursor-not-allowed" : "border-gray-300"
+                  }`}
+                >
+                  <option value="Voluntary Price Change">Voluntary Price Change</option>
+                  <option value="Mandated">Mandated</option>
+                  <option value="Price Increase">Price Increase</option>
+                  <option value="Price Decrease">Price Decrease</option>
+                  <option value="New Product Launch">New Product Launch</option>
+                  <option value="Re-pricing">Re-pricing</option>
+                  <option value="De-listing">De-listing</option>
+                </select>
+              </div>
+              
+              {/* SKUs from backend (product-360/eligible-skus) */}
               <div>
                 <label className="block mb-2 font-medium text-gray-700">SKU (Select Multiple)</label>
                 <div
@@ -1886,7 +1936,9 @@ function DetailPage({ row, onBack, loggedInUser, onSummit, onSave, onLocalApprov
     setFormData(prev => ({
       ...row,
       attachments: Array.isArray(row.attachments) ? row.attachments : [],
-      priceProposalData: prev.priceProposalData ?? row.priceProposalData
+      priceProposalData: prev.priceProposalData ?? row.priceProposalData,
+      reimbursementRows: prev.reimbursementRows ?? row.reimbursementRows,
+      vatPercentage: prev.vatPercentage ?? row.vatPercentage
     }));
   }, [row]);
 
@@ -2001,10 +2053,10 @@ function DetailPage({ row, onBack, loggedInUser, onSummit, onSave, onLocalApprov
             <div className="flex border-b">
               <Tab to="." label="SUMMARY" end/>
               <Tab to="PriceProposalPage" label="PRICE PROPOSAL" />
+              <Tab to="ReimbursementVATPage" label="REIMBURSEMENTS/VAT" />
               {(loggedInUser?.role === "REGIONAL USER" ||
                 loggedInUser?.role === "GLOBAL USER") && (
               <>
-              
               <Tab to="RecommendationPage" label="RECOMMENDATION" />
               </>
               )}

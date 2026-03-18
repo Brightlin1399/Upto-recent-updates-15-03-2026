@@ -83,53 +83,9 @@ class FinalisePCRRequest(BaseModel):
 
 # Master data: Admin CRUD on sku_mdgm_master (create/update/delete SKU rows).
 # Unique key: (sku_id, country, channel, price_type). NOT NULL: country, therapeutic_area, brand, channel, sku_id.
-class CreateMDGMRequest(BaseModel):
-    """Admin: create one MDGM row. All columns supported."""
-    sku_id: str
-    country: str
-    therapeutic_area: str
-    brand: str
-    channel: str = "Retail"
-    price_type: Optional[str] = None
-    region: Optional[str] = None
-    global_product_name: Optional[str] = None
-    local_product_name: Optional[str] = None
-    pu: Optional[int] = None
-    measure: Optional[str] = None
-    dimension: Optional[str] = None
-    volume_of_container: Optional[str] = None
-    container: Optional[str] = None
-    strength: Optional[str] = None
-    currency: Optional[str] = None
-    erp_applicable: Optional[str] = None
-    pack_size: Optional[int] = None
-    reimbursement_price_local: Optional[float] = None
-    reimbursement_price_eur: Optional[float] = None
-    reimbursement_status: Optional[str] = None
-    reimbursement_rate: Optional[float] = None
-    marketed_status: Optional[str] = None
-    current_price_eur: Optional[float] = None
-
-
-class AdminPCRUpdateRequest(BaseModel):
-    """Admin: update a PCR (e.g. status, proposed_price). All fields optional."""
-    status: Optional[str] = None  # e.g. draft, local_approved, regional_approved, escalated_to_global, global_approved, finalised
-    proposed_price: Optional[str] = None
-    product_name: Optional[str] = None
-    product_id: Optional[str] = None
-    current_price: Optional[str] = None
-    country: Optional[str] = None
-    therapeutic_area: Optional[str] = None
-    product_skus: Optional[str] = None
-    channel: Optional[str] = None
-    price_type: Optional[str] = None
-    effective_date: Optional[str] = None
-    price_change_reason: Optional[str] = None
-    price_change_reason_comments: Optional[str] = None
-
-
-class UpdateMDGMRequest(BaseModel):
-    """Admin: update an MDGM row by id. All fields optional; only provided fields are updated."""
+# Single source of truth for MDGM fields; Create requires key fields, Update keeps all optional.
+class MDGMFieldsBase(BaseModel):
+    """All sku_mdgm_master columns as optional. Used by Create (with overrides) and Update."""
     sku_id: Optional[str] = None
     country: Optional[str] = None
     therapeutic_area: Optional[str] = None
@@ -151,6 +107,49 @@ class UpdateMDGMRequest(BaseModel):
     reimbursement_price_local: Optional[float] = None
     reimbursement_price_eur: Optional[float] = None
     reimbursement_status: Optional[str] = None
+    reimbursement_type: Optional[str] = None
     reimbursement_rate: Optional[float] = None
+    vat_rate: Optional[float] = None
     marketed_status: Optional[str] = None
     current_price_eur: Optional[float] = None
+
+
+class CreateMDGMRequest(MDGMFieldsBase):
+    """Admin: create one MDGM row. Required: sku_id, country, therapeutic_area, brand, channel."""
+    sku_id: str
+    country: str
+    therapeutic_area: str
+    brand: str
+    channel: str = "Retail"
+
+
+class AdminPCRUpdateRequest(BaseModel):
+    """Admin: update a PCR (e.g. status, proposed_price). All fields optional."""
+    status: Optional[str] = None  # e.g. draft, local_approved, regional_approved, escalated_to_global, global_approved, finalised
+    proposed_price: Optional[str] = None
+    product_name: Optional[str] = None
+    product_id: Optional[str] = None
+    current_price: Optional[str] = None
+    country: Optional[str] = None
+    therapeutic_area: Optional[str] = None
+    product_skus: Optional[str] = None
+    channel: Optional[str] = None
+    price_type: Optional[str] = None
+    effective_date: Optional[str] = None
+    price_change_reason: Optional[str] = None
+    price_change_reason_comments: Optional[str] = None
+
+
+class UpdateMDGMRequest(MDGMFieldsBase):
+    """Admin: update an MDGM row by id. All fields optional; only provided fields are updated."""
+    pass
+
+
+class UpdateReimbVatRequest(BaseModel):
+    """Product page: country user (Local with that country) can update only reimb/VAT fields on an MDGM row."""
+    reimbursement_price_local: Optional[float] = None
+    reimbursement_price_eur: Optional[float] = None
+    reimbursement_status: Optional[str] = None
+    reimbursement_type: Optional[str] = None
+    reimbursement_rate: Optional[float] = None
+    vat_rate: Optional[float] = None

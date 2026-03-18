@@ -8,6 +8,7 @@ import {
   fetchPricing,
   fetchMdgmDetails,
   fetchAuditTrail,
+  updateMdgmReimbVat,
   type Region,
   type Country,
   type Brand,
@@ -67,9 +68,11 @@ export default function Product({ loggedInUser }: ProductProps) {
   const [activeTab, setActiveTab] = useState<TabId>("overview");
   const [apiError, setApiError] = useState<string | null>(null);
 
-  const [mdgmDetails, setMdgmDetails] = useState<{ rows: MdgmDetailRow[] } | null>(null);
+  const [mdgmDetails, setMdgmDetails] = useState<{ rows: MdgmDetailRow[]; reimb_vat_editable_by_user?: boolean } | null>(null);
   const [loadingMdgm, setLoadingMdgm] = useState(false);
   const [mdgmError, setMdgmError] = useState<string | null>(null);
+  const [reimbVatEdits, setReimbVatEdits] = useState<Record<number, Partial<MdgmDetailRow>>>({});
+  const [savingRowId, setSavingRowId] = useState<number | null>(null);
   const [auditEntries, setAuditEntries] = useState<AuditEntry[]>([]);
   const [loadingAudit, setLoadingAudit] = useState(false);
   const [auditForbidden, setAuditForbidden] = useState(false);
@@ -193,7 +196,7 @@ export default function Product({ loggedInUser }: ProductProps) {
     setLoadingMdgm(true);
     setMdgmError(null);
     fetchMdgmDetails(selectedBrand, country, therapeuticArea || undefined, loggedInUser?.id)
-      .then((data) => setMdgmDetails({ rows: data.rows || [] }))
+      .then((data) => setMdgmDetails({ rows: data.rows || [], reimb_vat_editable_by_user: data.reimb_vat_editable_by_user }))
       .catch((e) => {
         setMdgmDetails(null);
         setMdgmError("Failed to load MDGM details. Start the backend from the Backend folder: python app.py (port 5000). If it is running, check the browser console (F12) for details.");
@@ -481,6 +484,9 @@ export default function Product({ loggedInUser }: ProductProps) {
             {selectedBrand && country && mdgmError && <p className="p-6 text-sm text-amber-700">{mdgmError}</p>}
             {selectedBrand && country && !loadingMdgm && !mdgmError && mdgmDetails && (
               <div className="overflow-x-auto">
+                {mdgmDetails.reimb_vat_editable_by_user && (
+                  <p className="px-6 py-2 text-xs text-gray-500">Reimbursement and VAT are editable for your country. Change values and click Save on a row to update.</p>
+                )}
                 {mdgmDetails.rows.length === 0 ? <p className="p-6 text-sm text-gray-500">No MDGM rows.</p> : (
                   <table className="min-w-full divide-y divide-gray-200">
                     <thead><tr className="bg-gray-50">
@@ -488,24 +494,105 @@ export default function Product({ loggedInUser }: ProductProps) {
                       <th className="px-3 py-2 text-left text-xs font-medium uppercase text-gray-600">Channel</th>
                       <th className="px-3 py-2 text-left text-xs font-medium uppercase text-gray-600">Price type</th>
                       <th className="px-3 py-2 text-right text-xs font-medium uppercase text-gray-600">Current (EUR)</th>
+                      <th className="px-3 py-2 text-right text-xs font-medium uppercase text-gray-600">Reimb (local)</th>
+                      <th className="px-3 py-2 text-right text-xs font-medium uppercase text-gray-600">Reimb (EUR)</th>
+                      <th className="px-3 py-2 text-left text-xs font-medium uppercase text-gray-600">Reimb status</th>
+                      <th className="px-3 py-2 text-left text-xs font-medium uppercase text-gray-600">Reimb type</th>
+                      <th className="px-3 py-2 text-right text-xs font-medium uppercase text-gray-600">Reimb rate</th>
+                      <th className="px-3 py-2 text-right text-xs font-medium uppercase text-gray-600">VAT rate</th>
                       <th className="px-3 py-2 text-left text-xs font-medium uppercase text-gray-600">Currency</th>
                       <th className="px-3 py-2 text-left text-xs font-medium uppercase text-gray-600">Marketed</th>
                       <th className="px-3 py-2 text-left text-xs font-medium uppercase text-gray-600">Region</th>
                       <th className="px-3 py-2 text-left text-xs font-medium uppercase text-gray-600">Last pricing update</th>
+                      {mdgmDetails.reimb_vat_editable_by_user && <th className="px-3 py-2 text-left text-xs font-medium uppercase text-gray-600">Actions</th>}
                     </tr></thead>
                     <tbody>
-                      {mdgmDetails.rows.map((row) => (
-                        <tr key={row.id} className="hover:bg-gray-50">
-                          <td className="px-3 py-2 text-sm text-gray-900">{row.sku_id}</td>
-                          <td className="px-3 py-2 text-sm text-gray-700">{row.channel}</td>
-                          <td className="px-3 py-2 text-sm text-gray-700">{row.price_type ?? "—"}</td>
-                          <td className="px-3 py-2 text-right text-sm text-gray-900">{row.current_price_eur != null ? row.current_price_eur.toFixed(2) : "—"}</td>
-                          <td className="px-3 py-2 text-sm text-gray-600">{row.currency ?? "—"}</td>
-                          <td className="px-3 py-2 text-sm text-gray-600">{row.marketed_status ?? "—"}</td>
-                          <td className="px-3 py-2 text-sm text-gray-600">{row.region ?? "—"}</td>
-                          <td className="px-3 py-2 text-sm text-gray-600">{row.last_pricing_update ? new Date(row.last_pricing_update).toLocaleString() : "—"}</td>
-                        </tr>
-                      ))}
+                      {mdgmDetails.rows.map((row) => {
+                        const e = reimbVatEdits[row.id];
+                        const reimbLocal = e?.reimbursement_price_local !== undefined ? e.reimbursement_price_local : row.reimbursement_price_local;
+                        const reimbEur = e?.reimbursement_price_eur !== undefined ? e.reimbursement_price_eur : row.reimbursement_price_eur;
+                        const reimbStatus = e?.reimbursement_status !== undefined ? e.reimbursement_status : row.reimbursement_status;
+                        const reimbType = e?.reimbursement_type !== undefined ? e.reimbursement_type : row.reimbursement_type;
+                        const reimbRate = e?.reimbursement_rate !== undefined ? e.reimbursement_rate : row.reimbursement_rate;
+                        const vatRate = e?.vat_rate !== undefined ? e.vat_rate : row.vat_rate;
+                        const canEdit = mdgmDetails.reimb_vat_editable_by_user === true;
+                        const updateEdit = (field: keyof MdgmDetailRow, value: string | number | null) => {
+                          setReimbVatEdits((prev) => ({ ...prev, [row.id]: { ...prev[row.id], [field]: value === "" ? null : value } }));
+                        };
+                        const saveReimbVat = () => {
+                          if (!loggedInUser?.id) return;
+                          setSavingRowId(row.id);
+                          updateMdgmReimbVat(
+                            row.id,
+                            {
+                              reimbursement_price_local: reimbLocal ?? undefined,
+                              reimbursement_price_eur: reimbEur ?? undefined,
+                              reimbursement_status: reimbStatus ?? undefined,
+                              reimbursement_type: reimbType ?? undefined,
+                              reimbursement_rate: reimbRate ?? undefined,
+                              vat_rate: vatRate ?? undefined,
+                            },
+                            loggedInUser.id
+                          )
+                            .then(() => {
+                              setReimbVatEdits((prev) => { const next = { ...prev }; delete next[row.id]; return next; });
+                              return fetchMdgmDetails(selectedBrand, country, therapeuticArea || undefined, loggedInUser?.id);
+                            })
+                            .then((data) => setMdgmDetails((prev) => prev ? { ...prev, rows: data.rows || [] } : null))
+                            .catch((err) => setMdgmError(err?.message || "Failed to save"))
+                            .finally(() => setSavingRowId(null));
+                        };
+                        return (
+                          <tr key={row.id} className="hover:bg-gray-50">
+                            <td className="px-3 py-2 text-sm text-gray-900">{row.sku_id}</td>
+                            <td className="px-3 py-2 text-sm text-gray-700">{row.channel}</td>
+                            <td className="px-3 py-2 text-sm text-gray-700">{row.price_type ?? "—"}</td>
+                            <td className="px-3 py-2 text-right text-sm text-gray-900">{row.current_price_eur != null ? row.current_price_eur.toFixed(2) : "—"}</td>
+                            {canEdit ? (
+                              <>
+                                <td className="px-3 py-2 text-right">
+                                  <input type="number" step="any" className="w-24 px-2 py-1 text-sm border border-gray-300 rounded" value={reimbLocal ?? ""} onChange={(ev) => updateEdit("reimbursement_price_local", ev.target.value === "" ? null : Number(ev.target.value))} />
+                                </td>
+                                <td className="px-3 py-2 text-right">
+                                  <input type="number" step="any" className="w-24 px-2 py-1 text-sm border border-gray-300 rounded" value={reimbEur ?? ""} onChange={(ev) => updateEdit("reimbursement_price_eur", ev.target.value === "" ? null : Number(ev.target.value))} />
+                                </td>
+                                <td className="px-3 py-2">
+                                  <input type="text" className="w-32 px-2 py-1 text-sm border border-gray-300 rounded" value={reimbStatus ?? ""} onChange={(ev) => updateEdit("reimbursement_status", ev.target.value || null)} />
+                                </td>
+                                <td className="px-3 py-2">
+                                  <input type="text" className="w-32 px-2 py-1 text-sm border border-gray-300 rounded" value={reimbType ?? ""} onChange={(ev) => updateEdit("reimbursement_type", ev.target.value || null)} />
+                                </td>
+                                <td className="px-3 py-2 text-right">
+                                  <input type="number" step="any" className="w-20 px-2 py-1 text-sm border border-gray-300 rounded" value={reimbRate ?? ""} onChange={(ev) => updateEdit("reimbursement_rate", ev.target.value === "" ? null : Number(ev.target.value))} />
+                                </td>
+                                <td className="px-3 py-2 text-right">
+                                  <input type="number" step="any" className="w-20 px-2 py-1 text-sm border border-gray-300 rounded" value={vatRate ?? ""} onChange={(ev) => updateEdit("vat_rate", ev.target.value === "" ? null : Number(ev.target.value))} />
+                                </td>
+                              </>
+                            ) : (
+                              <>
+                                <td className="px-3 py-2 text-right text-sm text-gray-700">{row.reimbursement_price_local != null ? row.reimbursement_price_local.toFixed(2) : "—"}</td>
+                                <td className="px-3 py-2 text-right text-sm text-gray-700">{row.reimbursement_price_eur != null ? row.reimbursement_price_eur.toFixed(2) : "—"}</td>
+                                <td className="px-3 py-2 text-sm text-gray-600">{row.reimbursement_status ?? "—"}</td>
+                                <td className="px-3 py-2 text-sm text-gray-600">{row.reimbursement_type ?? "—"}</td>
+                                <td className="px-3 py-2 text-right text-sm text-gray-700">{row.reimbursement_rate != null ? row.reimbursement_rate.toFixed(2) : "—"}</td>
+                                <td className="px-3 py-2 text-right text-sm text-gray-700">{row.vat_rate != null ? row.vat_rate.toFixed(2) : "—"}</td>
+                              </>
+                            )}
+                            <td className="px-3 py-2 text-sm text-gray-600">{row.currency ?? "—"}</td>
+                            <td className="px-3 py-2 text-sm text-gray-600">{row.marketed_status ?? "—"}</td>
+                            <td className="px-3 py-2 text-sm text-gray-600">{row.region ?? "—"}</td>
+                            <td className="px-3 py-2 text-sm text-gray-600">{row.last_pricing_update ? new Date(row.last_pricing_update).toLocaleString() : "—"}</td>
+                            {canEdit && (
+                              <td className="px-3 py-2">
+                                <button type="button" className="px-2 py-1 text-xs font-medium text-white bg-blue-600 rounded hover:bg-blue-700 disabled:opacity-50" disabled={savingRowId === row.id} onClick={saveReimbVat}>
+                                  {savingRowId === row.id ? "Saving…" : "Save"}
+                                </button>
+                              </td>
+                            )}
+                          </tr>
+                        );
+                      })}
                     </tbody>
                   </table>
                 )}

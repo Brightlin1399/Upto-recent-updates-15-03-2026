@@ -12,6 +12,22 @@ import database
 from seed_data_mdgm import REGIONS, COUNTRIES, MDGM_ROWS
 
 
+def _first_value(row):
+    """Return the first column value from tuple/sqlite3.Row/dict-like."""
+    if row is None:
+        return None
+    try:
+        return row[0]
+    except Exception:
+        pass
+    if isinstance(row, dict):
+        return next(iter(row.values()), None)
+    if hasattr(row, "keys"):
+        keys = list(row.keys())
+        return row[keys[0]] if keys else None
+    return None
+
+
 async def seed():
     await database.init_db()
     conn = await database.get_connection()
@@ -27,25 +43,22 @@ async def seed():
                 (code, name, region),
             )
 
-        # 3) Users: Local, Regional, Global, Admin (country lives in user_countries for Local)
-        for name, email, role, ta, region in [
-            ("Vishal", "vishal@gmail.com", "Local", "CMC", "APAC"),
-            ("Rajesh", "rajesh@gmail.com", "Local", "CMC", "APAC"),
-            ("Rati", "rati@gmail.com", "Regional", "CMC", "APAC"),
-            ("Ramya", "ramya@gmail.com", "Regional", "Oncology", "APAC"),
-            ("Michael", "micheal@gmail.com", "Global", None, None),
-            ("Sarah", "sarah@gmail.com", "Admin", None, None),
+        # 3) Users (countries + therapeutic_areas are stored as CSV in users, then synced into mapping tables)
+        for name, email, role, region, countries, therapeutic_areas in [
+            ("Vishal", "vishal@gmail.com", "Local", "APAC", "IN,JP", "CMC"),
+            ("Rajesh", "rajesh@gmail.com", "Local", "APAC", "IN", "CMC"),
+            ("Rati", "rati@gmail.com", "Regional", "APAC", None, "CMC"),
+            ("Ramya", "ramya@gmail.com", "Regional", "APAC", None, "Oncology"),
+            ("Michael", "micheal@gmail.com", "Global", None, None, None),
+            ("Sarah", "sarah@gmail.com", "Admin", None, None, None),
         ]:
             await conn.execute(
-                "INSERT OR IGNORE INTO users (name, email, role, therapeutic_area, region) VALUES (?, ?, ?, ?, ?)",
-                (name, email, role, ta, region),
+                "INSERT OR IGNORE INTO users (name, email, role, region, countries, therapeutic_areas) VALUES (?, ?, ?, ?, ?, ?)",
+                (name, email, role, region, countries, therapeutic_areas),
             )
-        # Local users: assign countries via user_countries
-        for email, country in [("vishal@gmail.com", "IN"), ("rajesh@gmail.com", "IN")]:
-            await conn.execute(
-                "INSERT OR IGNORE INTO user_countries (user_id, country) SELECT id, ? FROM users WHERE email = ?",
-                (country, email),
-            )
+
+        # Sync mapping tables from users CSV values
+        await database.sync_user_mappings_from_users(conn)
 
         # 4) MDGM: ~100 rows with region, marketed_status, currency
         for row in MDGM_ROWS:
@@ -75,15 +88,16 @@ async def seed():
         async with conn.execute("SELECT id FROM users WHERE email = 'vishal@gmail.com' LIMIT 1") as cur:
             row = await cur.fetchone()
         if row:
-            uid = row[0]
+            # row can be a tuple, sqlite3.Row, or dict-like depending on row_factory
+            uid = row["id"] if isinstance(row, dict) or hasattr(row, "keys") else row[0]
             await conn.execute(
-                """INSERT OR REPLACE INTO pcrs (pcr_id_display, product_name, submitted_by, status, country, therapeutic_area, product_skus, proposed_price, current_price, floor_price, channel, price_type)
-                   VALUES ('PCR-TEST-001', 'EUTHYROX', ?, 'draft', 'IN', 'CMC', 'SKU-001,SKU-002', '110', '100', NULL, 'Retail', 'NSP Minimum')""",
+                """INSERT OR REPLACE INTO pcrs (pcr_id_display, product_name, submitted_by, status, country, therapeutic_area, product_skus, proposed_price, current_price, channel, price_type)
+                   VALUES ('PCR-TEST-001', 'EUTHYROX', ?, 'draft', 'IN', 'CMC', 'SKU-001,SKU-002', '110', '100', 'Retail', 'NSP Minimum')""",
                 (uid,),
             )
             await conn.execute(
-                """INSERT OR REPLACE INTO pcrs (pcr_id_display, product_name, submitted_by, status, country, therapeutic_area, product_skus, proposed_price, current_price, floor_price, channel, price_type)
-                   VALUES ('PCR-TEST-002', 'EUTHYROX', ?, 'local_approved', 'IN', 'CMC', 'SKU-001', '108', '100', NULL, 'Retail', 'NSP Minimum')""",
+                """INSERT OR REPLACE INTO pcrs (pcr_id_display, product_name, submitted_by, status, country, therapeutic_area, product_skus, proposed_price, current_price, channel, price_type)
+                   VALUES ('PCR-TEST-002', 'EUTHYROX', ?, 'local_approved', 'IN', 'CMC', 'SKU-001', '108', '100', 'Retail', 'NSP Minimum')""",
                 (uid,),
             )
 
@@ -91,7 +105,7 @@ async def seed():
 
         # Verify
         async with conn.execute("SELECT COUNT(*) FROM sku_mdgm_master") as cur:
-            n_mdgm = (await cur.fetchone())[0]
+            n_mdgm = _first_value(await cur.fetchone())
         async with conn.execute(
             "SELECT sku_id, country, therapeutic_area, channel, price_type, current_price_eur FROM sku_mdgm_master WHERE sku_id = 'SKU-NO-HISTORY'"
         ) as cur:

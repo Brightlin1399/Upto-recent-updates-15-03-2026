@@ -137,7 +137,7 @@ async def _user_can_approve_for_pcr(user_id: int, pcr_id: str) -> bool:
     """Check if user can approve/reject/edit this PCR (used for Regional/Global only; Local uses country+TA in each endpoint).
     Admin: cannot approve/reject.
     Global: can act on any PCR with status = escalated_to_global.
-    Regional: can act on PCRs in their region (PCR's country.region = user.region)."""
+    Regional: can act on PCRs in their region AND therapeutic area."""
     conn = await database.get_connection()
     try:
         async with conn.execute(
@@ -162,22 +162,34 @@ async def _user_can_approve_for_pcr(user_id: int, pcr_id: str) -> bool:
             pcr[3],
         )
         async with conn.execute(
-            "SELECT role, therapeutic_area, region FROM users WHERE id = ?",
+            "SELECT role, region FROM users WHERE id = ?",
             (user_id,),
         ) as cur:
             user = await cur.fetchone()
         if not user:
             return False
-        role, user_ta, user_region = user[0], user[1], user[2]
+        role, user_region = user[0], user[1]
         if role == "Admin":
             return False
         if role == "Global":
             # Global can act on any escalated PCR (no region/country restriction)
             return pcr_status == "escalated_to_global"
-        # Local/Regional: can act on PCRs in their region
+        if role != "Regional":
+            return False
+
+        # Regional: must match region and PCR's therapeutic area must be in user_therapeutic_areas
         if pcr_region is None or user_region is None:
             return False
-        return pcr_region == user_region
+        if pcr_region != user_region:
+            return False
+        pcr_ta_norm = (pcr_ta or "").strip()
+        if not pcr_ta_norm:
+            return False
+        async with conn.execute(
+            "SELECT 1 FROM user_therapeutic_areas WHERE user_id = ? AND therapeutic_area = ? LIMIT 1",
+            (user_id, pcr_ta_norm),
+        ) as cur:
+            return (await cur.fetchone()) is not None
     finally:
         await conn.close()
 
@@ -306,17 +318,21 @@ async def run_submit_approval_flow(pcr_id_display: str, submitted_by: int) -> di
         if not (country and therapeutic_area and channel and price_type):
             raise HTTPException(status_code=400, detail="country, therapeutic_area, channel, and price_type are required for price checks.")
 
-        # Require current price for every SKU at submit (no floor required; no auto-approval)
+        # Require current price for every SKU at submit for non-launch types (no floor required; no auto-approval).
+        # For New Product Launch we allow SKUs without a current price.
+        is_launch = pct_clean == "New Product Launch"
         for sku_id in sku_list:
             current_eur = await get_current_price_eur(
                 sku_id, country, therapeutic_area, channel, price_type=price_type
             )
-            if current_eur is None:
+            if not is_launch and current_eur is None:
                 raise HTTPException(
                     status_code=400,
                     detail=f"SKU '{sku_id}' has no current price (country={country}, channel={channel}, price_type={price_type}). Add MDGM or history before submitting.",
                 )
-            # Enforce basic price-change direction for explicit types
+            # Enforce basic price-change direction for explicit types (only when we have a current price)
+            if current_eur is None:
+                continue
             if pct_clean == "Price Increase":
                 if proposed_eur <= current_eur:
                     raise HTTPException(

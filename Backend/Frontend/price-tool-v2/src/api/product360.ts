@@ -103,6 +103,41 @@ export async function fetchSkus(brand: string, country: string, therapeuticArea?
   return res.json();
 }
 
+export type EligibleSkusResponse = {
+  brand: string;
+  country: string;
+  therapeutic_area: string;
+  channel: string;
+  price_type: string | null;
+  price_change_type: string;
+  skus_with_price: string[];
+  skus_without_price: string[];
+};
+
+export async function fetchEligibleSkus(
+  brand: string,
+  country: string,
+  therapeuticArea: string,
+  channel: string,
+  priceType: string | null,
+  priceChangeType: string,
+  userId?: number
+): Promise<EligibleSkusResponse> {
+  const params = new URLSearchParams({
+    brand,
+    country,
+    therapeutic_area: therapeuticArea,
+    channel,
+    price_change_type: priceChangeType,
+  });
+  if (priceType) params.set('price_type', priceType);
+  const res = await fetch(`${API}/product-360/eligible-skus?${params}`, {
+    headers: headersWithUser(userId),
+  });
+  if (!res.ok) throw new Error('Failed to fetch eligible SKUs');
+  return res.json();
+}
+
 export type MdgmDetailRow = {
   id: number;
   sku_id: string;
@@ -117,6 +152,22 @@ export type MdgmDetailRow = {
   currency: string | null;
   marketed_status: string | null;
   last_pricing_update: string | null;
+  /** Reimbursement (admin-editable per SKU combination) */
+  reimbursement_price_local: number | null;
+  reimbursement_price_eur: number | null;
+  reimbursement_status: string | null;
+  reimbursement_type: string | null;
+  reimbursement_rate: number | null;
+  vat_rate: number | null;
+};
+
+export type ReimbVatPayload = {
+  reimbursement_price_local?: number | null;
+  reimbursement_price_eur?: number | null;
+  reimbursement_status?: string | null;
+  reimbursement_type?: string | null;
+  reimbursement_rate?: number | null;
+  vat_rate?: number | null;
 };
 
 export async function fetchMdgmDetails(
@@ -124,11 +175,41 @@ export async function fetchMdgmDetails(
   country: string,
   therapeuticArea?: string,
   userId?: number
-): Promise<{ brand: string; country: string; therapeutic_area?: string | null; rows: MdgmDetailRow[] }> {
+): Promise<{
+  brand: string;
+  country: string;
+  therapeutic_area?: string | null;
+  rows: MdgmDetailRow[];
+  reimb_vat_editable_by_user?: boolean;
+}> {
   const params = new URLSearchParams({ brand, country });
   if (therapeuticArea) params.set('therapeutic_area', therapeuticArea);
   const res = await fetch(`${API}/product-360/mdgm-details?${params}`, { headers: headersWithUser(userId) });
   if (!res.ok) throw new Error('Failed to fetch MDGM details');
+  return res.json();
+}
+
+export async function updateMdgmReimbVat(
+  rowId: number,
+  payload: ReimbVatPayload,
+  userId: number
+): Promise<{ message: string; id: number; row: MdgmDetailRow }> {
+  const body: Record<string, unknown> = {};
+  if (payload.reimbursement_price_local !== undefined) body.reimbursement_price_local = payload.reimbursement_price_local;
+  if (payload.reimbursement_price_eur !== undefined) body.reimbursement_price_eur = payload.reimbursement_price_eur;
+  if (payload.reimbursement_status !== undefined) body.reimbursement_status = payload.reimbursement_status;
+  if (payload.reimbursement_type !== undefined) body.reimbursement_type = payload.reimbursement_type;
+  if (payload.reimbursement_rate !== undefined) body.reimbursement_rate = payload.reimbursement_rate;
+  if (payload.vat_rate !== undefined) body.vat_rate = payload.vat_rate;
+  const res = await fetch(`${API}/product-360/mdgm-row/${rowId}/reimb-vat`, {
+    method: 'PATCH',
+    headers: { 'Content-Type': 'application/json', 'X-User-Id': String(userId) },
+    body: JSON.stringify(body),
+  });
+  if (!res.ok) {
+    const err = await res.json().catch(() => ({}));
+    throw new Error((err as { detail?: string }).detail || 'Failed to update reimbursement/VAT');
+  }
   return res.json();
 }
 

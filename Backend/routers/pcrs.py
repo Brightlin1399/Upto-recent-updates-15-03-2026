@@ -45,13 +45,13 @@ async def submit_pcr(request: SubmitPCRRequest, x_user_id: int = Header(..., ali
         conn = await database.get_connection()
         try:
             async with conn.execute(
-                "SELECT role, therapeutic_area, region FROM users WHERE id = ?",
+                "SELECT role, region FROM users WHERE id = ?",
                 (submitted_by,),
             ) as cur:
                 user = await cur.fetchone()
             if not user:
                 raise HTTPException(status_code=400, detail="User not found")
-            role, user_ta, user_region = user[0], user[1], user[2]
+            role = user[0]
             if role != "Local":
                 raise HTTPException(status_code=400, detail="Only Local users can submit PCRs.")
             # Check country via user_countries
@@ -64,11 +64,7 @@ async def submit_pcr(request: SubmitPCRRequest, x_user_id: int = Header(..., ali
                         status_code=403,
                         detail="You can only submit PCRs for your assigned countries.",
                     )
-            if brand_ta != user_ta:
-                raise HTTPException(
-                    status_code=403,
-                    detail=f"Brand '{brand}' is in therapeutic area '{brand_ta}'. You can only create for your therapeutic area ({user_ta}).",
-                )
+            # Local can raise PCR for any therapeutic area (country must still be assigned).
             initial_status = "draft" if getattr(request, "save_as_draft", False) else "submitted"
             try:
                 await conn.execute(
@@ -454,7 +450,7 @@ async def get_all_pcrs(user_id: int = Header(..., alias="X-User-Id")):
     try:
         conn.row_factory = lambda c, r: dict(zip([col[0] for col in c.description], r))
 
-        # Lookup current user (role + region; country comes from user_countries for Locals)
+        # Lookup current user (role + region; Regional TAs from user_therapeutic_areas)
         async with conn.execute(
             "SELECT role, region FROM users WHERE id = ?",
             (user_id,),
@@ -486,8 +482,9 @@ async def get_all_pcrs(user_id: int = Header(..., alias="X-User-Id")):
             base_sql += " WHERE p.country IN (SELECT country FROM user_countries WHERE user_id = ?)"
             params.append(user_id)
         elif role == "Regional":
-            base_sql += " WHERE co.region = ?"
+            base_sql += " WHERE co.region = ? AND p.therapeutic_area IN (SELECT therapeutic_area FROM user_therapeutic_areas WHERE user_id = ?)"
             params.append(user_region)
+            params.append(user_id)
         elif role == "Global":
             # Global can act on escalated_to_global; can view global_approved and global_rejected (history)
             base_sql += " WHERE p.status IN ('escalated_to_global','global_approved','global_rejected')"
@@ -579,6 +576,7 @@ async def get_pcr(
                 user_region = (user.get("region") or "").strip()
                 pcr_country = (out.get("country") or "").strip()
                 pcr_region = (out.get("region") or "").strip()
+                pcr_ta = (out.get("therapeutic_area") or "").strip()
                 pcr_status = (out.get("status") or "").strip()
 
                 if role == "Local" and pcr_country:
@@ -591,6 +589,16 @@ async def get_pcr(
                             raise HTTPException(status_code=403, detail="You cannot view this PCR.")
                 if role == "Regional" and pcr_region and pcr_region != user_region:
                     raise HTTPException(status_code=403, detail="You cannot view this PCR.")
+                if role == "Regional":
+                    # Regional visibility: region must match and PCR's TA must be in user_therapeutic_areas
+                    if not pcr_ta:
+                        raise HTTPException(status_code=403, detail="You cannot view this PCR.")
+                    async with conn.execute(
+                        "SELECT 1 FROM user_therapeutic_areas WHERE user_id = ? AND therapeutic_area = ? LIMIT 1",
+                        (user_id, pcr_ta),
+                    ) as cur:
+                        if not await cur.fetchone():
+                            raise HTTPException(status_code=403, detail="You cannot view this PCR.")
                 if role == "Global" and pcr_status not in ("escalated_to_global", "global_approved", "global_rejected"):
                     # Global can act only on escalated_to_global but may view PCRs already handled at Global
                     raise HTTPException(status_code=403, detail="You cannot view this PCR.")
@@ -647,7 +655,7 @@ async def update_pcr(pcr_id: str = Path(...), request: UpdatePCRRequest = Body(.
     try:
         # Editor must be Local; country comes from user_countries
         async with conn.execute(
-            "SELECT id, role, therapeutic_area FROM users WHERE id = ?",
+            "SELECT id, role FROM users WHERE id = ?",
             (edited_by,),
         ) as cur:
             editor = await cur.fetchone()
@@ -679,16 +687,10 @@ async def update_pcr(pcr_id: str = Path(...), request: UpdatePCRRequest = Body(.
                 if not await cur.fetchone():
                     raise HTTPException(
                         status_code=403,
-                        detail="You can only update PCRs for your assigned countries and therapeutic area.",
+                        detail="You can only update PCRs for your assigned countries.",
                     )
 
-        # TA must match editor's TA
-        editor_ta = editor[2]
-        if pcr_ta != editor_ta:
-            raise HTTPException(
-                status_code=403,
-                detail="You can only update PCRs for your own country and therapeutic area.",
-            )
+        # Local can update PCRs for any therapeutic area within their assigned countries.
         updates = []
         params = []
         if request.pcr_id_display is not None:
@@ -754,13 +756,64 @@ async def update_pcr(pcr_id: str = Path(...), request: UpdatePCRRequest = Body(.
                     status_code=400,
                     detail="When PCR is already approved (regional or global), only proposed_price and effective_date can be updated. Other fields cannot be changed.",
                 )
-            if "proposed_price" in update_keys:
-                new_price_str = request.proposed_price
-                new_eur = _parse_price(new_price_str) if new_price_str else None
-                if new_eur is None:
-                    raise HTTPException(status_code=400, detail="proposed_price must be a valid price.")
-                floor_eur = regional_approved_eur if pcr_status == "regional_approved" else global_approved_eur
-                if floor_eur is not None and new_eur < float(floor_eur):
+        if "proposed_price" in update_keys:
+            # Parse the new proposed price
+            new_price_str = request.proposed_price
+            new_eur = _parse_price(new_price_str) if new_price_str else None
+            if new_eur is None:
+                raise HTTPException(status_code=400, detail="proposed_price must be a valid price.")
+
+            # Determine the approved price at this level (must exist for approved statuses)
+            if pcr_status == "regional_approved":
+                if regional_approved_eur is None:
+                    raise HTTPException(status_code=400, detail="Missing regional approved price; cannot edit proposed_price.")
+                approved_eur = float(regional_approved_eur)
+            else:  # global_approved
+                if global_approved_eur is None:
+                    raise HTTPException(status_code=400, detail="Missing global approved price; cannot edit proposed_price.")
+                approved_eur = float(global_approved_eur)
+
+            # Fetch the original current price and price_change_type from the PCR
+            async with conn.execute(
+                "SELECT current_price, price_change_type FROM pcrs WHERE pcr_id_display = ?",
+                (pcr_id,),
+            ) as cur2:
+                row2 = await cur2.fetchone()
+            current_str = row2[0] if row2 else None
+            pct_type = (row2[1] or "").strip() if row2 and row2[1] is not None else ""
+            current_eur = _parse_price(current_str) if current_str else None
+
+            if current_eur is None:
+                raise HTTPException(
+                    status_code=400,
+                    detail="Missing current price on PCR; cannot apply post-approval price edit rules.",
+                )
+
+            # Post-approval edit rules:
+            # Price Increase: current < new_proposed <= approved
+            if pct_type == "Price Increase":
+                if not (current_eur < new_eur <= approved_eur):
+                    raise HTTPException(
+                        status_code=400,
+                        detail=(
+                            "For Price Increase after approval, proposed_price must be "
+                            "greater than the original current price and less than or equal to the approved price."
+                        ),
+                    )
+            # Price Decrease: approved <= new_proposed < current
+            elif pct_type == "Price Decrease":
+                if not (approved_eur <= new_eur < current_eur):
+                    raise HTTPException(
+                        status_code=400,
+                        detail=(
+                            "For Price Decrease after approval, proposed_price must be "
+                            "greater than or equal to the approved price and lower than the original current price."
+                        ),
+                    )
+            # Other types (Re-pricing, De-listing, New Product Launch, etc.):
+            # keep simple guard: new_proposed >= approved
+            else:
+                if new_eur < approved_eur:
                     raise HTTPException(
                         status_code=400,
                         detail="Proposed price must be greater than or equal to the approved price at this level.",
@@ -812,7 +865,7 @@ async def update_pcr(pcr_id: str = Path(...), request: UpdatePCRRequest = Body(.
 async def finalise_pcr(pcr_id: str = Path(...), request: FinalisePCRRequest = Body(...), x_user_id: int = Header(..., alias="X-User-Id")):
     """Finalise an approved PCR. Writes each SKU's approved price to sku_price_history with effective_from = PCR effective_date (or today).
 
-    Only Local users can finalise, and only for PCRs in their own country and therapeutic_area. X-User-Id must equal finalised_by."""
+    Only Local users can finalise, and only for PCRs in their assigned countries. X-User-Id must equal finalised_by."""
     finalised_by = request.finalised_by
     if finalised_by != x_user_id:
         raise HTTPException(status_code=403, detail="X-User-Id must equal finalised_by.")
@@ -820,7 +873,7 @@ async def finalise_pcr(pcr_id: str = Path(...), request: FinalisePCRRequest = Bo
     try:
         # Finaliser must be Local; country comes from user_countries
         async with conn.execute(
-            "SELECT role, therapeutic_area FROM users WHERE id = ?",
+            "SELECT role FROM users WHERE id = ?",
             (finalised_by,),
         ) as cur:
             user = await cur.fetchone()
@@ -858,15 +911,10 @@ async def finalise_pcr(pcr_id: str = Path(...), request: FinalisePCRRequest = Bo
                 if not await cur.fetchone():
                     raise HTTPException(
                         status_code=403,
-                        detail="You can only finalise PCRs for your assigned countries and therapeutic area.",
+                        detail="You can only finalise PCRs for your assigned countries.",
                     )
 
-        user_ta = user[1]
-        if therapeutic_area != user_ta:
-            raise HTTPException(
-                status_code=403,
-                detail="You can only finalise PCRs for your own country and therapeutic area.",
-            )
+        # Local can finalise PCRs for any therapeutic area within their assigned countries.
         if status not in ("regional_approved", "global_approved"):
             raise HTTPException(
                 status_code=400,
@@ -909,14 +957,14 @@ async def finalise_pcr(pcr_id: str = Path(...), request: FinalisePCRRequest = Bo
             if price_eur < global_approved_price_eur:
                 raise HTTPException(status_code=400, detail="Proposed price is lower than the Global-approved price; please re-submit for approval.")
 
-        # Write history and mark finalised (floor_price_eur column kept for schema compat; we pass NULL)
+        # Write history and mark finalised
         effective_from = effective_date if effective_date else datetime.date.today().isoformat()
         for sku_id in sku_list:
             await conn.execute(
                 """INSERT INTO sku_price_history (sku_id, country, therapeutic_area, channel, price_type,
-                                                  price_eur, floor_price_eur, effective_from, pcr_id)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-                (sku_id, country, therapeutic_area, channel, price_type, price_eur, None, effective_from, pcr_id),
+                                                  price_eur, effective_from, pcr_id)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+                (sku_id, country, therapeutic_area, channel, price_type, price_eur, effective_from, pcr_id),
             )
 
         # Update PCR row: set current_price to the finalised price so list/detail show it; set status and finalized_at
@@ -978,7 +1026,7 @@ async def re_submit_pcr(pcr_id: str = Path(...), request: ResubmitPCRRequest = B
         product_skus_str_rs = pcr[4] if len(pcr) > 4 else None
         sku_list_resubmit = [s.strip() for s in (product_skus_str_rs or "").split(",") if s.strip()] if product_skus_str_rs else []
         async with conn.execute(
-            "SELECT id, role, therapeutic_area FROM users WHERE id = ?",
+            "SELECT id, role FROM users WHERE id = ?",
             (re_submitted_by,),
         ) as cur:
             re_submitter = await cur.fetchone()
@@ -997,15 +1045,10 @@ async def re_submit_pcr(pcr_id: str = Path(...), request: ResubmitPCRRequest = B
                 if not await cur.fetchone():
                     raise HTTPException(
                         status_code=403,
-                        detail="You can only resubmit PCRs for your assigned countries and therapeutic area.",
+                        detail="You can only resubmit PCRs for your assigned countries.",
                     )
 
-        # TA must match
-        if pcr_ta != re_submitter[2]:
-            raise HTTPException(
-                status_code=403,
-                detail="You can only resubmit PCRs for your own country and therapeutic area.",
-            )
+        # Local can resubmit PCRs for any therapeutic area within their assigned countries.
         await conn.execute(
             """
             UPDATE pcrs SET status = 'submitted',

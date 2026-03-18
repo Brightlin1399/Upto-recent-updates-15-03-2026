@@ -1,5 +1,5 @@
 import database
-
+from email_service import queue_email
 
 async def create_notification(user_id, notification_type, title, message, pcr_id=None):
     """Create an in-app notification. pcr_id may be None for admin/MDGM-only actions."""
@@ -67,7 +67,9 @@ async def notify_on_local_approve(pcr_id):
         conn.row_factory = lambda c, r: dict(zip([col[0] for col in c.description], r))
         if region is not None and therapeutic_area is not None:
             async with conn.execute(
-                "SELECT id, email FROM users WHERE role = 'Regional' AND region = ? AND therapeutic_area = ?",
+                """SELECT u.id, u.email FROM users u
+                   JOIN user_therapeutic_areas uta ON uta.user_id = u.id
+                   WHERE u.role = 'Regional' AND u.region = ? AND uta.therapeutic_area = ?""",
                 (region, therapeutic_area),
             ) as cur:
                 regional = await cur.fetchall()
@@ -246,21 +248,26 @@ async def notify_admin_action(country, therapeutic_area, action_kind, entity_lab
             async with conn.execute(
                 """SELECT u.id FROM users u
                    JOIN user_countries uc ON uc.user_id = u.id
-                   WHERE u.role = 'Local' AND uc.country = ? AND u.therapeutic_area = ?""",
+                   JOIN user_therapeutic_areas uta ON uta.user_id = u.id
+                   WHERE u.role = 'Local' AND uc.country = ? AND uta.therapeutic_area = ?""",
                 (country, therapeutic_area),
             ) as cur:
                 for row in await cur.fetchall():
                     user_ids.add(row["id"])
         if country and therapeutic_area and region:
             async with conn.execute(
-                "SELECT id FROM users WHERE role = 'Regional' AND region = ? AND therapeutic_area = ?",
+                """SELECT u.id FROM users u
+                   JOIN user_therapeutic_areas uta ON uta.user_id = u.id
+                   WHERE u.role = 'Regional' AND u.region = ? AND uta.therapeutic_area = ?""",
                 (region, therapeutic_area),
             ) as cur:
                 for row in await cur.fetchall():
                     user_ids.add(row["id"])
         elif region and therapeutic_area:
             async with conn.execute(
-                "SELECT id FROM users WHERE role = 'Regional' AND region = ? AND therapeutic_area = ?",
+                """SELECT u.id FROM users u
+                   JOIN user_therapeutic_areas uta ON uta.user_id = u.id
+                   WHERE u.role = 'Regional' AND u.region = ? AND uta.therapeutic_area = ?""",
                 (region, therapeutic_area),
             ) as cur:
                 for row in await cur.fetchall():
